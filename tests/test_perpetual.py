@@ -2,8 +2,8 @@ import asyncio
 
 import pytest
 
-from edpy._compat import *  # noqa
-from edpy.perpetual import ensure_perpetual, Perpetual
+from asynced._compat import *  # noqa
+from asynced.perpetual import ensure_perpetual, Perpetual
 
 
 def expect_stop_async_iteration():
