@@ -21,6 +21,8 @@ from typing import (
     TypeVar,
 )
 
+from . import asyncio_utils
+
 if sys.version_info < (3, 10):
     from ._compat import anext, aiter
 from ._typing import SupportsAnext, TypeAlias
@@ -96,7 +98,7 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         loop object used by the perpetual. If it's not provided, the perpetual
         uses the default event loop.
         """
-        self._loop = loop or asyncio.get_event_loop()
+        self._loop = loop or asyncio_utils.ensure_event_loop()
         self._callbacks = []
         self._present = self._future = self._create_future()
 
@@ -207,13 +209,24 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         """Return True if the perpetual was cancelled."""
         return self._present.cancelled()
 
-    def stop(self, msg: str | None = None) -> bool:
-        """Stop the perpetual and schedule callbacks.
+    def stop(
+        self,
+        msg: str | None = None,
+        *,
+        schedule_callbacks: bool = False
+    ) -> bool:
+        """Stop the perpetual.
 
         If the perpetual is empty, cancels instead. Otherwise, change the
-        perpetual's state to stopped, schedule  the callbacks, and return True.
+        perpetual's state to stopped, and return True.
         """
-        stopped = self._future.cancel()
+        present, future = self._present, self._future
+
+        if not schedule_callbacks:
+            for fn, _ in self._callbacks:
+                self._future.remove_done_callback(fn)
+
+        stopped = self._future.cancel(msg)
 
         # present must be either cancelled, result or error
         assert self._present.done()
@@ -276,9 +289,6 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
             context = contextvars.copy_context()
         self._callbacks.append((fn, context))
 
-        if not self._present.done():
-            self._loop.call_soon(fn, self, context=context)  # type: ignore
-
     def remove_result_callback(self, fn: _Callback) -> int:
         """Remove all instances of a callback from the "call when done" list.
 
@@ -305,9 +315,8 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         if self._future.cancelled():
             raise asyncio.CancelledError
 
-        self._future.set_result(result)
-
         self.__rotate()
+        self._present.set_result(result)
 
     def set_exception(self, exception: BaseException) -> None:
         """Set or update the exception of the perpetual.
@@ -318,9 +327,8 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         if self._future.cancelled():
             raise asyncio.CancelledError
 
-        self._future.set_exception(exception)
-
         self.__rotate()
+        self._present.set_exception(exception)
 
     # So-called internal methods
 
@@ -370,9 +378,12 @@ def ensure_perpetual(
             )
             sink.cancel()
 
+    async def _call_anext() -> _T:
+        return await asyncio.shield(anext(source))
+
     def _schedule_anext() -> None:
         if not sink.done() and not sink.cancelled():
-            result = sink.get_loop().create_task(anext(source))
+            result = sink.get_loop().create_task(_call_anext())
             result.add_done_callback(_call_set_result)
         else:
             logger.debug('not scheduling the anext() for %s', repr(sink))
@@ -388,10 +399,7 @@ def ensure_perpetual(
             must_cancel = True
 
         if result.cancelled():
-            logger.warning(
-                'ensure_perpetual __anext__ future was unexpectedly '
-                'cancelled'
-            )
+            logger.debug('ensure_perpetual __anext__ task was cancelled')
             must_cancel = True
 
         else:
