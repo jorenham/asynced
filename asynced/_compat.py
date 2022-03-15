@@ -61,3 +61,5 @@ if sys.version_info < (3, 10):
             if default != MISSING:
                 return default
             raise
+else:
+    from builtins import anext, aiter
