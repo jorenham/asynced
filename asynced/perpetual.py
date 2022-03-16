@@ -23,11 +23,8 @@ from typing import (
 
 from . import asyncio_utils
 
-if sys.version_info < (3, 10):
-    from ._compat import anext, aiter
+from ._compat import anext, aiter
 from ._typing import TypeAlias
-
-from .result_types import Empty, Result, Error, MaybeResult
 
 _T = TypeVar('_T')
 _E = TypeVar('_E', bound=BaseException)
@@ -86,7 +83,7 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         '_present',
         '_future'
     )
-    __match_args__: Final = ('maybe_result', 'is_done')
+    __match_args__: Final = ('raw_result', 'is_done')
 
     _loop: Final[asyncio.AbstractEventLoop]
 
@@ -139,36 +136,14 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
             raise StopAsyncIteration from e
 
     @property
-    def is_empty(self) -> bool:
-        p = self._present
-        return not p.done() or p.cancelled()
-
-    @property
-    def is_result(self) -> bool:
-        p = self._present
-        return p.done() and not p.cancelled() and p.exception() is None
-
-    @property
-    def is_error(self) -> bool:
-        p = self._present
-        return p.done() and not p.cancelled() and p.exception() is not None
-
-    @property
-    def is_done(self) -> bool:
-        return self._future.cancelled()
-
-    @property
-    def maybe_result(self) -> MaybeResult[_T, BaseException]:
-        """Never raises, but wraps the result / exception.
-
-        Intended for pattern matching: Empty, Result(_), or Error(_).
-        """
+    def raw_result(self) -> _T | BaseException | None:
+        """Directly returns rhe result, exception, or or None if empty."""
         present = self._present
         if not present.done() or present.cancelled():
-            return Empty
+            return None
         if (exc := present.exception()) is not None:
-            return Error(exc)
-        return Result(present.result())
+            return exc
+        return present.result()
 
     # For compatibility with asyncio.Future
 
@@ -223,16 +198,13 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         """Return True if the perpetual was cancelled."""
         return self._present.cancelled()
 
-    def stop(
-        self,
-        msg: str | None = None,
-    ) -> bool:
+    def stop(self) -> bool:
         """Stop the perpetual.
 
         If the perpetual is empty, cancels instead. Otherwise, change the
         perpetual's state to stopped, and return True.
         """
-        stopped = self._future.cancel(msg)
+        stopped = self._future.cancel()
 
         # present must be either cancelled, result or error
         assert self._present.done()
@@ -245,7 +217,7 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         Done means that the perpetual was cancelled and a result / exception is
         available.
         """
-        return not self.is_empty and self._future.cancelled()
+        return self._future.cancelled()
 
     def empty(self) -> bool:
         """Return True if the perpetual is Empty.
@@ -259,10 +231,6 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
 
         If the perpetual is empty, raises asyncio.InvalidStateError. If the
         perpetual has an exception set, this exception is raised.
-
-        Unline asyncio.Future.result(), Perpetual.result() won't raise
-        asyncio.CancelledError if cancelled and a result was set before
-        cancelling.
         """
         return self._present.result()
 
@@ -270,7 +238,7 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         """Return the exception that was set on this perpetual.
 
         The exception (or None if no exception was set) is returned only if
-        the future is not empty. If the perpetual has been cancelled, raises
+        the perpetual is not empty. If the perpetual has been cancelled, raises
         asyncio.CancelledError.  If the perpetual is empty, raises
         asyncio.InvalidStateError.
         """

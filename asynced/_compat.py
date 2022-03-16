@@ -1,6 +1,13 @@
-__all__ = ('aiter', 'anext')
+__all__ = (
+    'PY310', 'PY311',
+    'anext', 'aiter',
+)
 
+from typing import Final
 import sys
+
+PY310: Final[bool] = sys.version_info >= (3, 10)
+PY311: Final[bool] = sys.version_info >= (3, 11)
 
 if sys.version_info < (3, 10):
     """anext() and aiter() were only released in 3.10, while async iterators 

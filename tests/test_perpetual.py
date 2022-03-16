@@ -149,13 +149,13 @@ async def test_ensure_perpetual_exception():
     with pytest.raises(ZeroDivisionError):
         await asyncio.wait_for(anext(perpetual), .1)
 
-    assert perpetual.is_error
+    assert perpetual.exception()
     assert not perpetual.cancelled()
     assert not perpetual.done()
 
     with expect_stop_async_iteration():
         await asyncio.wait_for(anext(perpetual), .1)
 
-    assert perpetual.is_error
+    assert perpetual.exception()
     assert perpetual.done()
     assert not perpetual.cancelled()
