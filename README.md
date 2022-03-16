@@ -1,6 +1,20 @@
 # AsyncED
 
-Async python for Event-Driven applications
+-----
+
+[![PyPI version shields.io](https://img.shields.io/pypi/v/asynced.svg)](https://pypi.python.org/pypi/asynced/)
+[![PyPI pyversions](https://img.shields.io/pypi/pyversions/asynced.svg)](https://pypi.python.org/pypi/asynced/)
+[![PyPI license](https://img.shields.io/pypi/l/asynced.svg)](https://pypi.python.org/pypi/asynced/)
+
+-----
+
+**Async** python for **E**vent-**D**riven applications
+
+## Installation
+
+```bash
+pip install asynced
+```
 
 ## High-level API
 
