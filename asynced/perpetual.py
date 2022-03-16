@@ -6,7 +6,6 @@ import asyncio
 import contextvars
 import logging
 import reprlib
-import sys
 from typing import (
     Any,
     AsyncGenerator,
@@ -34,7 +33,7 @@ _Callback: TypeAlias = Callable[[_T], Any]
 _Callbacks: TypeAlias = list[tuple[_Callback[_T], contextvars.Context]]
 
 
-logger: Final[logging.Logger] = logging.getLogger(__name__)
+logger: Final[logging.Logger] = logging.getLogger('asynced.perpetual')
 
 
 class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
