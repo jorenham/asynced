@@ -25,7 +25,7 @@ from . import asyncio_utils
 
 if sys.version_info < (3, 10):
     from ._compat import anext, aiter
-from ._typing import SupportsAnext, TypeAlias
+from ._typing import TypeAlias
 
 from .result_types import Empty, Result, Error, MaybeResult
 
@@ -33,7 +33,8 @@ _T = TypeVar('_T')
 _E = TypeVar('_E', bound=BaseException)
 _S = TypeVar('_S', bound='Perpetual')
 
-_Callback: TypeAlias = Callable[[asyncio.Future[_T]], Any]
+_Callback: TypeAlias = Callable[[_T], Any]
+_Callbacks: TypeAlias = list[tuple[_Callback[_T], contextvars.Context]]
 
 
 logger: Final[logging.Logger] = logging.getLogger(__name__)
@@ -77,12 +78,21 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
       are called each time a result is set.
 
     """
-    __slots__ = ('_loop', '_callbacks', '_present', '_future')
+    __slots__ = (
+        '_loop',
+        '_callbacks_result',
+        '_callbacks_exception',
+        '_callbacks_done',
+        '_present',
+        '_future'
+    )
     __match_args__: Final = ('maybe_result', 'is_done')
 
     _loop: Final[asyncio.AbstractEventLoop]
 
-    _callbacks: list[tuple[_Callback[_T], contextvars.Context]]
+    _callbacks_result: _Callbacks[_T]
+    _callbacks_exception: _Callbacks[BaseException]
+    _callbacks_done: _Callbacks[Perpetual[_T]]
 
     _present: asyncio.Future[_T]
     _future: asyncio.Future[_T]
@@ -99,8 +109,12 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         uses the default event loop.
         """
         self._loop = loop or asyncio_utils.ensure_event_loop()
-        self._callbacks = []
-        self._present = self._future = self._create_future()
+        self._callbacks_result = []
+        self._callbacks_exception = []
+        self._callbacks_done = []
+
+        self._present = self._future = self._loop.create_future()
+        self._future.add_done_callback(self.__schedule_callbacks)
 
     def __repr__(self) -> str:
         info = [self._state.lower()]
@@ -212,20 +226,12 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
     def stop(
         self,
         msg: str | None = None,
-        *,
-        schedule_callbacks: bool = False
     ) -> bool:
         """Stop the perpetual.
 
         If the perpetual is empty, cancels instead. Otherwise, change the
         perpetual's state to stopped, and return True.
         """
-        present, future = self._present, self._future
-
-        if not schedule_callbacks:
-            for fn, _ in self._callbacks:
-                self._future.remove_done_callback(fn)
-
         stopped = self._future.cancel(msg)
 
         # present must be either cancelled, result or error
@@ -272,9 +278,10 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
 
     def add_result_callback(
         self,
-        fn: _Callback[_T],
+        fn: Callable[[_T], Any],
         *,
-        context: contextvars.Context | None = None
+        context: contextvars.Context | None = None,
+        immediate: bool = True,
     ) -> None:
         """Add a callback to be run when the perpetual result or exception is
         set.
@@ -282,27 +289,34 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         The callback is called with a single argument - the perpetual object.
         If the perpetual is not empty when this is called, the callback is
         scheduled with call_soon.
+
+        If immediate is True (the default) and a result is currently available,
+        the callback will be scheduled to run immediately
         """
-        self._future.add_done_callback(fn, context=context)
+        if self.cancelled():
+            raise asyncio.CancelledError
+
+        present = self._present
 
         if context is None:
             context = contextvars.copy_context()
-        self._callbacks.append((fn, context))
+        self._callbacks_result.append((fn, context))
+
+        if immediate and present.done():
+            self.__schedule_callbacks(present)
 
     def remove_result_callback(self, fn: _Callback) -> int:
         """Remove all instances of a callback from the "call when done" list.
 
         Returns the number of callbacks removed.
         """
-        self._future.remove_done_callback(fn)
-
-        filtered_callbacks = [
+        filtered = [
             (f, ctx)
-            for (f, ctx) in self._callbacks
+            for (f, ctx) in self._callbacks_result
             if f != fn
         ]
-        if removed_count := len(self._callbacks) - len(filtered_callbacks):
-            self._callbacks[:] = filtered_callbacks
+        if removed_count := len(self._callbacks_result) - len(filtered):
+            self._callbacks_result[:] = filtered
 
         return removed_count
 
@@ -332,14 +346,34 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
 
     # So-called internal methods
 
-    def _create_future(self) -> asyncio.Future[_T]:
-        future = self._loop.create_future()
-        for fn, context in self._callbacks:
-            future.add_done_callback(fn, context=context)
-        return future
-
     def __rotate(self) -> None:
-        self._present, self._future = self._future, self._create_future()
+        # rotate the futures; ensuring that the future is ahead of us
+        next_future = self._loop.create_future()
+        next_future.add_done_callback(self.__schedule_callbacks)
+
+        self._present, self._future = self._future, next_future
+
+    def __schedule_callbacks(self, present: asyncio.Future[_T]) -> None:
+        assert present.done()
+
+        arg: Any
+        callbacks: _Callbacks[Any]
+
+        if present.cancelled():
+            arg = self
+            if callbacks := self._callbacks_done[:]:
+                self._callbacks_done[:] = []
+
+        elif (exc := present.exception()) is not None:
+            arg = exc
+            callbacks = self._callbacks_exception[:]
+
+        else:
+            arg = present.result()
+            callbacks = self._callbacks_result[:]
+
+        for callback, ctx in callbacks:
+            self._loop.call_soon(callback, arg, context=ctx)  # type: ignore
 
 
 def ensure_perpetual(
