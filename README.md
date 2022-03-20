@@ -22,6 +22,46 @@ pip install asynced
 
 ## Low-level API
 
+### Promise
+
+Inspired by (but not a clone of) Javascript promises, `asynced.Promise` is a
+thin wrapper around any coroutine. 
+
+Like `asyncio.Task`, when a promise is created, the wrapped coroutine will run 
+in the background, and can be awaited to get the result or exception. In 
+addition, a `Promise` can be "chained" with sync or async functions, producing 
+another `Promise`.
+
+Example:
+
+```pycon
+import asyncio
+from asynced import Promise
+
+
+async def formulate_ultimate_question() -> str:
+    await asyncio.sleep(0.25)
+    return (
+        'What is The Answer to the Ultimate Question of Life, the Universe, '
+        'and Everything?'
+    )
+
+
+async def compute_answer(question: str):
+    await asyncio.sleep(0.75)
+    return (len(question) >> 1) + 1
+
+
+async def amain():
+    answer = await Promise(formulate_ultimate_question()).then(compute_answer)
+    print(answer)
+
+
+asyncio.run(amain())
+```
+
+
+
 ### Perpetual
 
 Where asyncio futures are the bridge between low-level events and a

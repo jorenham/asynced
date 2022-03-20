@@ -1,42 +1,23 @@
 import asyncio
-from typing import Final, NoReturn, TypeVar
-
 from asynced import Promise
 
-_T = TypeVar('_T')
 
-
-DELAY: Final[float] = 1.0
-
-
-async def print_and_pass(arg: _T) -> _T:
-    print(repr(arg))
-    return await asyncio.sleep(DELAY, arg)
-
-
-async def print_and_raise(arg: Exception) -> NoReturn:
-    print(repr(arg))
-    await asyncio.sleep(DELAY)
-    raise arg
-
-
-async def amain() -> None:
-    res = await (
-        Promise
-        .resolve('spam')
-        .then(print_and_pass).except_(print_and_raise)
-        .then(len)
-        .then(print_and_pass).except_(print_and_raise)
-        .then(lambda n: n / 0)
-        .then(print_and_pass).except_(print_and_raise)
-        .then(lambda n: (n - 1) * 666)  # skipped
-        .then(print_and_pass).except_(print_and_raise)
-        .except_(lambda e: 42)
-        .then(print_and_pass).except_(print_and_raise)
+async def formulate_ultimate_question() -> str:
+    await asyncio.sleep(0.25)
+    return (
+        'What is The Answer to the Ultimate Question of Life, the Universe, '
+        'and Everything?'
     )
-    print()
-    print(f'result: {res!r}')
 
 
-if __name__ == '__main__':
-    asyncio.run(amain())
+async def compute_answer(question: str):
+    await asyncio.sleep(0.75)
+    return (len(question) >> 1) + 1
+
+
+async def amain():
+    answer = await Promise(formulate_ultimate_question()).then(compute_answer)
+    print(answer)
+
+
+asyncio.run(amain())
