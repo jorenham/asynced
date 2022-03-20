@@ -84,7 +84,7 @@ class Promise(Generic[_R, _E]):
         return self.__state != 'pending'
 
     @classmethod
-    def resolve(cls, result: _RT) -> Promise[_RT, None]:
+    def resolve(cls, result: _RT, /) -> Promise[_RT, None]:
         """Returns a new Promise that has resolved to the given result."""
         async def _resolve() -> _RT:
             return result
@@ -92,8 +92,16 @@ class Promise(Generic[_R, _E]):
         return Promise(_resolve())
 
     @classmethod
-    def reject(cls, exc: _ET) -> Promise[NoReturn, _ET]:
+    def reject(cls, exc: type[_ET] | _ET, /) -> Promise[NoReturn, _ET]:
         """Returns a new Promise that is rejected with the given error."""
+        if not (
+            isinstance(exc, Exception)
+            or isinstance(exc, type) and issubclass(exc, Exception)
+        ):
+            raise TypeError(
+                f'{cls.__name__}.reject exception must derive from Exception'
+            )
+
         async def _reject() -> NoReturn:
             raise exc
 
