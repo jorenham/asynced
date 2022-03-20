@@ -171,3 +171,4 @@ NothingType: TypeAlias = Literal[_NothingEnum.NOTHING]
 Nothing: Final[NothingType] = _NothingEnum.NOTHING
 
 Maybe: TypeAlias = Union[_T, NothingType]
+MaybeE: TypeAlias = Union[_T, BaseException, NothingType]
