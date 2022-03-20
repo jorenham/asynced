@@ -4,6 +4,7 @@ __all__ = ('Promise', 'PromiseE')
 
 import asyncio
 import sys
+from types import TracebackType
 from typing import (
     Any,
     Awaitable,
@@ -60,14 +61,23 @@ class Promise(Generic[_R, _E]):
     def __init__(self, coro: Awaitable[_R]):
         self.__state = PENDING
         self.__result = asyncio_utils.create_future()
-        self.__task = asyncio.create_task(coro)
+        self.__task = asyncio.ensure_future(coro)
 
         self.__task.add_done_callback(self.__on_result)
 
     def __await__(self) -> Generator[Any, None, _R]:
         return self.__result.__await__()
 
-    __iter__ = __await__  # make compatible with 'yield from'.
+    # collection.abc.Coroutine emulation: otherwise asyncio.iscoroutine fails
+
+    def send(self, value: Any) -> NoReturn:
+        raise NotImplementedError
+
+    def throw(self, typ: Any, val: None = None, tb: None = None) -> NoReturn:
+        raise NotImplementedError
+
+    def close(self) -> NoReturn:
+        raise NotImplementedError
 
     def __bool__(self) -> bool:
         """Return True if done"""
@@ -129,6 +139,8 @@ class Promise(Generic[_R, _E]):
                 return await asyncio_utils.wrap_coro(result)
 
         return Promise(_exec())
+
+    catch = except_  # js-style alias
 
     def finally_(
         self,
