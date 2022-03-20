@@ -3,27 +3,29 @@ from __future__ import annotations
 __all__ = ('Promise', 'PromiseE')
 
 import asyncio
-import concurrent.futures
-import warnings
+import sys
 from typing import (
     Any,
-    Awaitable, Callable,
-    cast, Generator,
+    Awaitable,
+    Callable,
+    Final,
+    Generator,
     Generic,
     Literal,
+    NoReturn,
+    Optional,
     TypeVar,
 )
 
 from . import asyncio_utils
-from ._typing import Maybe, Nothing, TypeAlias
+from ._typing import MaybeCoro, TypeAlias
 
 
-_T = TypeVar('_T')
 _R = TypeVar('_R')
-_E = TypeVar('_E')
+_E = TypeVar('_E', bound=Optional[Exception])
 
 _RT = TypeVar('_RT')
-_ET = TypeVar('_ET')
+_ET = TypeVar('_ET', bound=Exception)
 
 
 PromiseState: TypeAlias = Literal[
@@ -33,250 +35,158 @@ PromiseState: TypeAlias = Literal[
     'cancelled',
 ]
 
+PENDING: Final[PromiseState] = 'pending'
+FULFILLED: Final[PromiseState] = 'fulfilled'
+REJECTED: Final[PromiseState] = 'rejected'
+CANCELLED: Final[PromiseState] = 'cancelled'
 
-class PromiseError(Exception):
-    pass
+
+# intern the states
+def __intern_states() -> None:
+    for state in [PENDING, FULFILLED, REJECTED, CANCELLED]:
+        sys.intern(state)
 
 
-class PromiseRejected(PromiseError):
-    pass
+__intern_states()
 
 
 class Promise(Generic[_R, _E]):
-    __slots__ = ('__state', '__result', '__future', '__task')
+    __slots__ = ('__state', '__result', '__task')
 
     __state: PromiseState
-    __result: Maybe[_R | _E]
+    __result: asyncio.Future[_R]
+    __task: asyncio.Task[_R]
 
-    def __init__(
-        self,
-        coro_or_executor: Awaitable[_R] | Callable[
-            [Callable[[_R], None], Callable[[_E], None]],
-            Awaitable[_R | None] | _R | None
-        ], /,
-    ):
-        self.__state = 'pending'
+    def __init__(self, coro: Awaitable[_R]):
+        self.__state = PENDING
+        self.__result = asyncio_utils.create_future()
+        self.__task = asyncio.create_task(coro)
 
-        coro: Awaitable[_R | None]
-        if callable(coro_or_executor):
-            fn = asyncio_utils.ensure_async_function(coro_or_executor)
-            coro = fn(self._fulfill, self._reject)
-        elif asyncio.iscoroutine(coro_or_executor):
-            coro = coro_or_executor
-        else:
-            raise TypeError(
-                f'{type(self).__name__} accepts either an awaitable object or '
-                f'a function like `(resolve, reject) -> Awaitable[None] | None`'
-            )
-
-        self.__future = asyncio_utils.create_future()
-        self.__result = Nothing
-
-        self.__task = task = asyncio.create_task(coro)
-        task.add_done_callback(self.__on_result)
-
-    @property
-    def _state(self) -> PromiseState:
-        return self.__state
-
-    @_state.setter
-    def _state(self, state: PromiseState) -> None:
-        if self.__state != 'pending':
-            raise asyncio.InvalidStateError(self.__state)
-
-        self.__state = state
-
-    @property
-    def _result(self) -> _R:
-        if self.__result is Nothing:
-            raise asyncio.InvalidStateError(self.__state)
-
-        if self.__state == 'rejected':
-            err = self.__result
-            if isinstance(err, BaseException):
-                raise err
-            raise PromiseRejected(err) from None
-
-        if self.__state == 'fulfilled':
-            return cast(_R, self.__result)
-
-        raise asyncio.InvalidStateError(self.__state)
-
-    @_result.setter
-    def _result(self, result: _R | _E) -> None:
-        if self.__result is not Nothing:
-            raise asyncio.InvalidStateError('result already set')
-
-        state = self.__state
-        if state not in ('fulfilled', 'rejected'):
-            raise asyncio.InvalidStateError(state)
-
-        self.__result = result
-
-        fut = self.__future
-        if state == 'fulfilled':
-            fut.set_result(result)
-        else:
-            if isinstance(result, BaseException):
-                fut.set_exception(result)
-            else:
-                fut.set_exception(PromiseRejected(result))
+        self.__task.add_done_callback(self.__on_result)
 
     def __await__(self) -> Generator[Any, None, _R]:
-        return self.__future.__await__()
+        return self.__result.__await__()
 
     __iter__ = __await__  # make compatible with 'yield from'.
 
     def __bool__(self) -> bool:
+        """Return True if done"""
         return self.__state != 'pending'
 
     @classmethod
-    def resolve(cls, result: _R) -> Promise[_R, None]:
-        return Promise(lambda resolve, _: resolve(result))
+    def resolve(cls, result: _RT) -> Promise[_RT, None]:
+        """Returns a new Promise that has resolved to the given result."""
+        async def _resolve() -> _RT:
+            return result
+
+        return Promise(_resolve())
 
     @classmethod
-    def reject(cls, reason: _E) -> Promise[None, _E]:
-        return Promise(lambda __, reject: reject(reason))
+    def reject(cls, exc: _ET) -> Promise[NoReturn, _ET]:
+        """Returns a new Promise that is rejected with the given error."""
+        async def _reject() -> NoReturn:
+            raise exc
+
+        return Promise(_reject())
 
     def then(
         self,
-        on_fulfilled: Callable[[_R], Awaitable[_RT] | _RT],
-        /, *,
-        executor: Maybe[concurrent.futures.Executor | None] = Nothing
+        on_fulfilled: Callable[[_R], MaybeCoro[_RT]],
+        /,
     ) -> PromiseE[_RT]:
+        """When this promise resolves, this funcion is called with the
+        result as only argument, and the return value or raised exception will
+        be used to resolve or reject the new promise that is returned.
+
+        The function can be sync or async. Only exceptions that derive from
+        Exception will propagate to the new promise silently, those that are
+        derive from BaseException only will be reraised on the spot.
+        """
         async def _exec() -> _RT:
             value = await self
-            result = on_fulfilled(value)
-
-            return await result if asyncio.iscoroutine(result) else result
+            result: MaybeCoro[_RT] = on_fulfilled(value)
+            return await asyncio_utils.wrap_coro(result)
 
         return Promise(_exec())
 
     def except_(
         self,
-        on_rejected: Callable[[_E], Awaitable[_RT] | _RT],
-        /, *,
-        executor: Maybe[concurrent.futures.Executor | None] = Nothing,
+        on_rejected: Callable[[Exception], MaybeCoro[_RT]],
+        /,
     ) -> PromiseE[_R | _RT]:
-        async def _exec():
+        """When this promise is rejected, this function is called with the
+        exception as only argument. In turn, the returned promise resolves to
+        the returned value, or is rejected if the function reraises.
+
+        The function can be sync or async. Exceptions that only derive from
+        BaseException will not propagate.
+        """
+        async def _exec() -> _R | _RT:
             try:
                 return await self
-            except Exception as e:
-                result = on_rejected(value)
-
-                return await result if asyncio.iscoroutine(result) else result
+            except Exception as exc:
+                result = on_rejected(exc)
+                return await asyncio_utils.wrap_coro(result)
 
         return Promise(_exec())
 
     def finally_(
         self,
-        on_finally: Callable[[], Awaitable[None] | None],
-        /, *,
-        executor: Maybe[concurrent.futures.Executor | None] = Nothing,
-    ) -> PromiseE[_RT]:
-        async def _exec():
+        on_finally: Callable[[], MaybeCoro[None]],
+        /,
+    ) -> Promise[_R, _E]:
+        """The given function will be called if resolved or rejected in the
+        returned promise.
+
+        The function can be sync or async. If the wrapped coroutine is
+        cancelled or rejected with an exception that only derives from
+        BaseException, this 'finally' handler will not be called.
+        """
+        async def _exec() -> _R:
             try:
                 return await self
             finally:
-                result = on_finally()
-                if asyncio.iscoroutine(result):
-                    await result
+                await asyncio_utils.wrap_coro(on_finally())
 
         return Promise(_exec())
 
-    # Internal methods
+    @property
+    def _state(self) -> PromiseState:
+        """The promise state: pending, fulfilled, rejected or cancelled."""
+        return self.__state
 
-    def _fulfill(self, value: _R) -> None:
-        if self._state != 'pending':
-            if value is not None:
-                warnings.warn(RuntimeWarning(
-                    f'ignoring resolved value {value!r} after {self!r} became '
-                    f'{self._state}'
-                ))
-            return
+    @property
+    def _result(self) -> _R | NoReturn:
+        """Return the result if fulfilled.
 
-        self._state = 'fulfilled'
-        self._result = value
+        Raises asyncio.InvalidStateError if pending, raises
+        asyncio.CancelledError if the wrapped coro was cancelled,
+        or if the coro raised an exception, raises that.
+        """
+        return self.__result.result()
 
-    def _reject(self, reason: _E) -> None:
-        self._state = 'rejected'
-        # mypy fails with property setters that don't match the getter
-        self._result = reason  # type: ignore
-
-    def _cancel(self, msg: str | None = None) -> None:
-        if self._state != 'pending':
-            warnings.warn(RuntimeWarning(
-                f'ignoring cancellation of {self!r} after it became '
-                f'{self._state}'
-            ))
-            return
-
-        self._state = 'cancelled'
-        self.__future.cancel(msg)
-
-    def __on_result(self, task: asyncio.Task[_R | None]) -> None:
-        # coro/executor callback
+    def __on_result(self, task: asyncio.Task[_R]) -> None:
+        """Internal: done callback of wrapped coro"""
         assert task.done()
+        fut = self.__result
+        assert not fut.done()
+        assert self.__state == 'pending'
 
         try:
             result = task.result()
-        except asyncio.CancelledError as e:
-            msg = e.args[0] if e.args else None
-            self._cancel(msg=msg)
-        except Exception as e:
-            if self.__state != 'pending':
-                raise
-
-            self._reject(cast(_E, e))
+        except asyncio.CancelledError as exc:
+            self.__state = CANCELLED
+            fut.cancel(exc.args[0] if exc.args else None)
+        except Exception as exc:
+            self.__state = REJECTED
+            fut.set_exception(exc)
+        except BaseException as exc:
+            self.__state = REJECTED
+            fut.set_exception(exc)
+            raise
         else:
-            if self.__state == 'pending':
-                self._fulfill(cast(_R, result))
-
-    def __chain(
-        self,
-        on_fulfilled: Callable[[_R], Awaitable[_RT] | _RT] | None = None,
-        on_rejected: Callable[[_E], Awaitable[_RT] | _RT] | None = None,
-        on_finally: Callable[[], Awaitable[None] | None] | None = None,
-        *,
-        executor: Maybe[concurrent.futures.Executor | None] = Nothing
-    ) -> PromiseE[_R | _RT]:
-        if on_fulfilled is not None:
-            _on_fulfilled = asyncio_utils.ensure_async_function(
-                on_fulfilled,
-                executor=executor
-            )
-        else:
-            _on_fulfilled = None
-
-        if on_rejected is not None:
-            _on_rejected = asyncio_utils.ensure_async_function(
-                on_rejected,
-                executor=executor,
-            )
-        else:
-            _on_rejected = None
-
-        if on_finally is not None:
-            _on_finally = asyncio_utils.ensure_async_function(on_finally)
-        else:
-            _on_finally = None
-
-        async def __executor() -> _R | _RT:
-            try:
-                value = await self
-            except Exception as e:
-                if _on_rejected is not None:
-                    return await _on_rejected(e)
-                raise
-            else:
-                if _on_fulfilled is not None:
-                    return await _on_fulfilled(value)
-                return value
-            finally:
-                if _on_finally is not None:
-                    await _on_finally()
-
-        return Promise(__executor())
+            self.__state = FULFILLED
+            fut.set_result(result)
 
 
 PromiseE: TypeAlias = Promise[_R, Exception]

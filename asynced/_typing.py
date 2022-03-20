@@ -60,7 +60,7 @@ _ET = TypeVar('_ET', bound=BaseException)  # exception type
 
 LiteralType: TypeAlias = Union[None, bool, int, bytes, str, enum.Enum]
 
-AnyFuture: TypeAlias = Union[asyncio.Future[_T], Awaitable[_T]]
+MaybeCoro: TypeAlias = Union[Awaitable[_T], _T]
 
 Identity: TypeAlias = Callable[[_T], _T]
 
