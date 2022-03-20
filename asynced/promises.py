@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-__all__ = ('Promise', 'PromiseE')
+__all__ = (
+    'Promise',
+)
 
 import asyncio
 import sys
-from types import TracebackType
 from typing import (
     Any,
     Awaitable,
@@ -111,7 +112,7 @@ class Promise(Generic[_R, _E]):
         self,
         on_fulfilled: Callable[[_R], MaybeCoro[_RT]],
         /,
-    ) -> PromiseE[_RT]:
+    ) -> Promise[_RT, Exception]:
         """When this promise resolves, this funcion is called with the
         result as only argument, and the return value or raised exception will
         be used to resolve or reject the new promise that is returned.
@@ -131,7 +132,7 @@ class Promise(Generic[_R, _E]):
         self,
         on_rejected: Callable[[Exception], MaybeCoro[_RT]],
         /,
-    ) -> PromiseE[_R | _RT]:
+    ) -> Promise[_R | _RT, Exception]:
         """When this promise is rejected, this function is called with the
         exception as only argument. In turn, the returned promise resolves to
         the returned value, or is rejected if the function reraises.
@@ -186,7 +187,7 @@ class Promise(Generic[_R, _E]):
         return self.__result.result()
 
     def __on_result(self, task: asyncio.Task[_R]) -> None:
-        """Internal: done callback of wrapped coro"""
+        """Internal: Done callback of the wrapped coroutine."""
         assert task.done()
         fut = self.__result
         assert not fut.done()
@@ -207,6 +208,3 @@ class Promise(Generic[_R, _E]):
         else:
             self.__state = FULFILLED
             fut.set_result(result)
-
-
-PromiseE: TypeAlias = Promise[_R, Exception]
