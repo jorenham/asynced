@@ -34,7 +34,7 @@ another `Promise`.
 
 Example:
 
-```pycon
+```python
 import asyncio
 from asynced import Promise
 
