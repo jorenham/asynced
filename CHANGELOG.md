@@ -1,4 +1,11 @@
-## [0.2.0] - 2022-03-16
+## [0.2.1] - 2022-03-22
+
+### Changed
+
+- Typing fixes
+- Promise now only accepts one generic type argument
+
+## [0.2.0] - 2022-03-21
 
 ### Added
 
