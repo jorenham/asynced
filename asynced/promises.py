@@ -18,7 +18,6 @@ from typing import (
     Generic,
     Literal,
     NoReturn,
-    Optional,
     TypeVar,
 )
 
@@ -27,10 +26,7 @@ from ._typing import MaybeCoro, TypeAlias
 
 
 _R = TypeVar('_R')
-_E = TypeVar('_E', bound=Optional[Exception])
-
 _RT = TypeVar('_RT')
-_ET = TypeVar('_ET', bound=Exception)
 
 
 PromiseState: TypeAlias = Literal[
@@ -55,7 +51,7 @@ def __intern_states() -> None:
 __intern_states()
 
 
-class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R, _E]):
+class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R]):
     __slots__ = ('__state', '__result', '__task')
 
     __state: PromiseState
@@ -99,7 +95,7 @@ class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R, _E]):
         return self.__state != 'pending'
 
     @classmethod
-    def resolve(cls, result: _RT, /) -> Promise[_RT, None]:
+    def resolve(cls, result: _RT, /) -> Promise[_RT]:
         """Returns a new Promise that has resolved to the given result."""
         async def _resolve() -> _RT:
             return result
@@ -107,7 +103,7 @@ class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R, _E]):
         return Promise(_resolve())
 
     @classmethod
-    def reject(cls, exc: type[_ET] | _ET, /) -> Promise[NoReturn, _ET]:
+    def reject(cls, exc: type[Exception] | Exception, /) -> Promise[NoReturn]:
         """Returns a new Promise that is rejected with the given error."""
         if not (
             isinstance(exc, Exception)
@@ -126,7 +122,7 @@ class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R, _E]):
         self,
         on_fulfilled: Callable[[_R], MaybeCoro[_RT]],
         /,
-    ) -> Promise[_RT, Exception]:
+    ) -> Promise[_RT]:
         """When this promise resolves, this funcion is called with the
         result as only argument, and the return value or raised exception will
         be used to resolve or reject the new promise that is returned.
@@ -146,7 +142,7 @@ class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R, _E]):
         self,
         on_rejected: Callable[[Exception], MaybeCoro[_RT]],
         /,
-    ) -> Promise[_R | _RT, Exception]:
+    ) -> Promise[_R | _RT]:
         """When this promise is rejected, this function is called with the
         exception as only argument. In turn, the returned promise resolves to
         the returned value, or is rejected if the function reraises.
@@ -169,7 +165,7 @@ class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R, _E]):
         self,
         on_finally: Callable[[], MaybeCoro[None]],
         /,
-    ) -> Promise[_R, _E]:
+    ) -> Promise[_R]:
         """The given function will be called if resolved or rejected in the
         returned promise.
 
