@@ -5,11 +5,14 @@ __all__ = (
 )
 
 import asyncio
+import collections.abc
 import sys
+from types import TracebackType
 from typing import (
     Any,
     Awaitable,
     Callable,
+    cast,
     Final,
     Generator,
     Generic,
@@ -19,7 +22,7 @@ from typing import (
     TypeVar,
 )
 
-from . import asyncio_utils
+from ._aio_utils import create_future, ensure_awaitable
 from ._typing import MaybeCoro, TypeAlias
 
 
@@ -52,7 +55,7 @@ def __intern_states() -> None:
 __intern_states()
 
 
-class Promise(Generic[_R, _E]):
+class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R, _E]):
     __slots__ = ('__state', '__result', '__task')
 
     __state: PromiseState
@@ -61,7 +64,7 @@ class Promise(Generic[_R, _E]):
 
     def __init__(self, coro: Awaitable[_R]):
         self.__state = PENDING
-        self.__result = asyncio_utils.create_future()
+        self.__result = create_future()
         self.__task = asyncio.ensure_future(coro)
 
         self.__task.add_done_callback(self.__on_result)
@@ -71,14 +74,25 @@ class Promise(Generic[_R, _E]):
 
     # collection.abc.Coroutine emulation: otherwise asyncio.iscoroutine fails
 
-    def send(self, value: Any) -> NoReturn:
-        raise NotImplementedError
+    def send(self, value: None) -> NoReturn:
+        raise StopIteration
 
-    def throw(self, typ: Any, val: None = None, tb: None = None) -> NoReturn:
-        raise NotImplementedError
+    def throw(
+        self,
+        typ: type[BaseException] | BaseException,
+        val: BaseException | object | None = None,
+        tb: TracebackType | None = None
+    ) -> NoReturn:
+        if val is None:
+            if tb is None:
+                raise typ
+            raise cast(type[BaseException], typ)()
+        if tb is not None:
+            raise val.with_traceback(tb)  # type: ignore
+        assert False
 
     def close(self) -> NoReturn:
-        raise NotImplementedError
+        raise StopIteration
 
     def __bool__(self) -> bool:
         """Return True if done"""
@@ -124,7 +138,7 @@ class Promise(Generic[_R, _E]):
         async def _exec() -> _RT:
             value = await self
             result: MaybeCoro[_RT] = on_fulfilled(value)
-            return await asyncio_utils.wrap_coro(result)
+            return await ensure_awaitable(result)
 
         return Promise(_exec())
 
@@ -145,7 +159,7 @@ class Promise(Generic[_R, _E]):
                 return await self
             except Exception as exc:
                 result = on_rejected(exc)
-                return await asyncio_utils.wrap_coro(result)
+                return await ensure_awaitable(result)
 
         return Promise(_exec())
 
@@ -167,7 +181,7 @@ class Promise(Generic[_R, _E]):
             try:
                 return await self
             finally:
-                await asyncio_utils.wrap_coro(on_finally())
+                await ensure_awaitable(on_finally())
 
         return Promise(_exec())
 

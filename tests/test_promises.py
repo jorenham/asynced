@@ -1,17 +1,24 @@
-import asyncio
-
 import pytest
 
-from asynced import asyncio_utils, Promise
+from asynced import Promise
+import asyncio
 
 
 async def _raiser(coro):
     raise await coro
 
 
+def future() -> asyncio.Future:
+    return asyncio.get_event_loop().create_future()
+
+
+def future_promise() -> tuple[asyncio.Future, Promise]:
+    fut = future()
+    return fut, Promise(fut)
+
+
 async def test_initial():
-    fut = asyncio_utils.create_future()
-    p = Promise(fut)
+    fut, p = future_promise()
 
     task = asyncio.create_task(p)
     assert not task.done()
@@ -41,8 +48,7 @@ async def test_reject():
 
 
 async def test_cancel():
-    fut = asyncio_utils.create_future()
-    p = Promise(fut)
+    fut, p = future_promise()
     fut.cancel()
 
     with pytest.raises(asyncio.CancelledError):
@@ -82,10 +88,8 @@ async def test_already_rejected_base_exception():
 
 
 async def test_then():
-    fut1 = asyncio_utils.create_future()
-    fut2 = asyncio_utils.create_future()
-
-    p1 = Promise(fut1)
+    fut1, p1 = future_promise()
+    fut2 = future()
 
     async def _then(_res1):
         _res2 = await fut2
@@ -115,8 +119,6 @@ async def test_then():
 
 
 async def test_catch():
-    fut = asyncio_utils.create_future()
-
     async def _then(_):
         return 'fail'
 
@@ -125,6 +127,7 @@ async def test_catch():
             return exc.args[0] if exc.args else None
         raise
 
+    fut = future()
     p = Promise(fut).then(_then).catch(_catch)
 
     assert p._state == 'pending'
@@ -135,8 +138,7 @@ async def test_catch():
 
 
 async def test_finally():
-    fut_resolve = asyncio_utils.create_future()
-    fut_reject = asyncio_utils.create_future()
+    fut_resolve, fut_reject = future(), future()
 
     calls = []
 

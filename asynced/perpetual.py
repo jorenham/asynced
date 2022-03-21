@@ -13,15 +13,15 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
-    cast, Final,
+    cast,
+    Final,
     Generator,
     Generic,
     Literal,
     TypeVar,
 )
 
-from . import asyncio_utils
-
+from ._aio_utils import get_event_loop
 from ._compat import anext, aiter
 from ._typing import TypeAlias
 
@@ -104,7 +104,7 @@ class Perpetual(Awaitable[_T], AsyncIterator[_T], Generic[_T]):
         loop object used by the perpetual. If it's not provided, the perpetual
         uses the default event loop.
         """
-        self._loop = loop or asyncio_utils.ensure_event_loop()
+        self._loop = loop or get_event_loop()
         self._callbacks_result = []
         self._callbacks_exception = []
         self._callbacks_done = []

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 __all__ = (
     'PY310', 'PY311',
     'anext', 'aiter',
@@ -20,18 +22,14 @@ if sys.version_info < (3, 10):
         AsyncIterable,
         AsyncIterator,
         Final,
-        Literal,
         overload,
         TypeVar,
         Union,
     )
-    from ._typing import SupportsAnext, TypeAlias
+    from ._typing import Maybe, Nothing, SupportsAnext
 
     _T = TypeVar('_T')
     _VT = TypeVar('_VT')
-
-    MissingT: TypeAlias = Literal['__missing__']
-    MISSING: Final[MissingT] = '__missing__'
 
     # noinspection PyShadowingBuiltins
     def aiter(iterable: AsyncIterable[_T]) -> AsyncIterator[_T]:
@@ -49,12 +47,12 @@ if sys.version_info < (3, 10):
 
     # noinspection PyShadowingBuiltins
     @overload
-    async def anext(iterable: SupportsAnext[_T], default: _VT) -> _T: ...
+    async def anext(iterable: SupportsAnext[_T], default: _VT) -> _T | _VT: ...
 
     # noinspection PyShadowingBuiltins
     async def anext(
         iterable: SupportsAnext[_T],
-        default: Union[_VT, MissingT] = MISSING
+        default: Maybe[_VT] = Nothing
     ) -> Union[_T, _VT]:
         if not hasattr(iterable, '__anext__'):
             raise TypeError(
@@ -65,7 +63,7 @@ if sys.version_info < (3, 10):
         try:
             return await iterable.__anext__()
         except StopAsyncIteration:
-            if default != MISSING:
+            if default is not Nothing:
                 return default
             raise
 else:
