@@ -16,7 +16,7 @@ async def compute_answer(question: str):
 
 
 async def amain():
-    answer = await Promise(formulate_ultimate_question()).then(compute_answer)
+    answer = await Promise(formulate_ultimate_question()).amap(compute_answer)
     print(answer)
 
 

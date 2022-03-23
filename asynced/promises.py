@@ -2,219 +2,254 @@ from __future__ import annotations
 
 __all__ = (
     'Promise',
+    'PromiseIterator',
 )
 
 import asyncio
-import collections.abc
-import sys
-from types import TracebackType
 from typing import (
     Any,
-    Awaitable,
-    Callable,
-    cast,
-    Final,
+    AsyncIterator,
+    Coroutine,
     Generator,
     Generic,
-    Literal,
     NoReturn,
     TypeVar,
 )
+from typing_extensions import Self
 
-from ._aio_utils import create_future, ensure_awaitable
-from ._typing import MaybeCoro, TypeAlias
+from ._aio_utils import create_task, wrap_async
+from ._typing import AFunc1, DefaultCoroutine, Func1
+from .interfaces import Catchable, Mappable
 
+_T = TypeVar('_T')
+_T_co = TypeVar('_T_co', covariant=True)
 
 _R = TypeVar('_R')
-_RT = TypeVar('_RT')
+_E = TypeVar('_E', bound=BaseException)
 
 
-PromiseState: TypeAlias = Literal[
-    'pending',
-    'fulfilled',
-    'rejected',
-    'cancelled',
-]
+class Promise(DefaultCoroutine[_T], Mappable[_T], Catchable[_T], Generic[_T]):
+    """Thin wrapper around asyncio.Task, inspired by javascript promises, and
+    function programming in general."""
 
-PENDING: Final[PromiseState] = 'pending'
-FULFILLED: Final[PromiseState] = 'fulfilled'
-REJECTED: Final[PromiseState] = 'rejected'
-CANCELLED: Final[PromiseState] = 'cancelled'
+    __slots__ = ('_task', )
 
+    _task: asyncio.Future[_T]
 
-# intern the states
-def __intern_states() -> None:
-    for state in [PENDING, FULFILLED, REJECTED, CANCELLED]:
-        sys.intern(state)
+    def __init__(self, coro: Coroutine[Any, Any, _T] | asyncio.Future[_T], /):
+        if asyncio.iscoroutine(coro):
+            task = create_task(coro)
+        elif isinstance(coro, Promise):
+            task = coro._task
+        elif isinstance(coro, asyncio.Future):
+            task = coro
+        else:
+            raise TypeError(f'a coroutine was expected, got {coro!r}')
 
-
-__intern_states()
-
-
-class Promise(collections.abc.Coroutine[NoReturn, None, _R], Generic[_R]):
-    __slots__ = ('__state', '__result', '__task')
-
-    __state: PromiseState
-    __result: asyncio.Future[_R]
-    __task: asyncio.Task[_R]
-
-    def __init__(self, coro: Awaitable[_R]):
-        self.__state = PENDING
-        self.__result = create_future()
-        self.__task = asyncio.ensure_future(coro)
-
-        self.__task.add_done_callback(self.__on_result)
-
-    def __await__(self) -> Generator[Any, None, _R]:
-        return self.__result.__await__()
-
-    # collection.abc.Coroutine emulation: otherwise asyncio.iscoroutine fails
-
-    def send(self, value: None) -> NoReturn:
-        raise StopIteration
-
-    def throw(
-        self,
-        typ: type[BaseException] | BaseException,
-        val: BaseException | object | None = None,
-        tb: TracebackType | None = None
-    ) -> NoReturn:
-        if val is None:
-            if tb is None:
-                raise typ
-            raise cast(type[BaseException], typ)()
-        if tb is not None:
-            raise val.with_traceback(tb)  # type: ignore
-        assert False
-
-    def close(self) -> NoReturn:
-        raise StopIteration
-
-    def __bool__(self) -> bool:
-        """Return True if done"""
-        return self.__state != 'pending'
+        self._task = task
+    
+    def __await__(self) -> Generator[Any, None, _T]:
+        return self._task.__await__()
 
     @classmethod
-    def resolve(cls, result: _RT, /) -> Promise[_RT]:
-        """Returns a new Promise that has resolved to the given result."""
-        async def _resolve() -> _RT:
-            return result
+    def as_fulfilled(cls, value: _T):
+        """Create an already fulfilled promise from the value."""
+        async def _coro():
+            return value
 
-        return Promise(_resolve())
+        return cls(_coro())
 
     @classmethod
-    def reject(cls, exc: type[Exception] | Exception, /) -> Promise[NoReturn]:
-        """Returns a new Promise that is rejected with the given error."""
-        if not (
-            isinstance(exc, Exception)
-            or isinstance(exc, type) and issubclass(exc, Exception)
-        ):
-            raise TypeError(
-                f'{cls.__name__}.reject exception must derive from Exception'
-            )
+    def as_rejected(cls, exc: Exception | type[Exception]):
+        """Create an already rejected promise from the exception."""
+        if not (isinstance(exc, Exception) or issubclass(exc, Exception)):
+            raise TypeError('exception must derive from Exception')
 
-        async def _reject() -> NoReturn:
+        async def _coro():
             raise exc
 
-        return Promise(_reject())
+        return cls(_coro())
 
-    def then(
-        self,
-        on_fulfilled: Callable[[_R], MaybeCoro[_RT]],
-        /,
-    ) -> Promise[_RT]:
+    # Synchrounous inspection properties
+
+    @property
+    def is_pending(self) -> bool:
+        """True if there's no result is available yet."""
+        return not self._task.done()
+
+    @property
+    def is_fulfilled(self) -> bool:
+        """True if the coro finished without raising."""
+        t = self._task
+        return t.done() and not t.cancelled() and t.exception() is None
+
+    @property
+    def is_rejected(self) -> bool:
+        """True if the coro raised an exception."""
+        t = self._task
+        return t.done() and not t.cancelled() and t.exception() is not None
+
+    @property
+    def is_cancelled(self) -> bool:
+        """True if """
+        return self._task.cancelled()
+
+    @property
+    def result(self) -> _T | NoReturn:
+        """Return the fulfilled result of this promise.
+
+        If the promise is cancelled, raises asyncio.CancelledError.
+        If the promise is pending, raises asyncio.InvalidStateError.
+        If the promise is rejected, this exception is raised.
+        """
+        return self._task.result()
+
+    @property
+    def exception(self) -> BaseException | None:
+        """Return the rejection exception of this promise.
+
+        If the promise is cancelled, raises asyncio.CancelledError.
+        If the promise is pending, raises asyncio.InvalidStateError.
+        If the promise is fulfilled, returns None.
+        """
+        return self._task.exception()
+
+    @property
+    def _loop(self) -> asyncio.AbstractEventLoop:
+        return self._task.get_loop()
+
+    def map(self, func: Func1[_T, _R], /) -> Self[_R]:
         """When this promise resolves, this funcion is called with the
         result as only argument, and the return value or raised exception will
-        be used to resolve or reject the new promise that is returned.
-
-        The function can be sync or async. Only exceptions that derive from
-        Exception will propagate to the new promise silently, those that are
-        derive from BaseException only will be reraised on the spot.
+        be used to resolve or reject the returned promise.
         """
-        async def _exec() -> _RT:
-            value = await self
-            result: MaybeCoro[_RT] = on_fulfilled(value)
-            return await ensure_awaitable(result)
+        return self.amap(wrap_async(func))
 
-        return Promise(_exec())
+    def amap(self, afunc: AFunc1[_T, _R], /) -> Self[_R]:
+        """Like .map(), but for an async function, or a function that returns
+        an awaitable.
+        """
+        async def _amap() -> _R:
+            return await afunc(await self._task)
 
-    def except_(
+        return Promise(_amap())
+
+    def catch(
         self,
-        on_rejected: Callable[[Exception], MaybeCoro[_RT]],
+        exc_typ: type[_E] | tuple[type[_E], ...],
+        handler: Func1[[_E], _R],
         /,
-    ) -> Promise[_R | _RT]:
-        """When this promise is rejected, this function is called with the
-        exception as only argument. In turn, the returned promise resolves to
-        the returned value, or is rejected if the function reraises.
-
-        The function can be sync or async. Exceptions that only derive from
-        BaseException will not propagate.
+    ) -> Promise[_T | _R]:
+        """When the provided exception type is raised withing this promise,
+        the function is called with the exception as argument. In turn, the
+        new promise resolves to the returned value, or is rejected if the
+        function (re)raises.
         """
-        async def _exec() -> _R | _RT:
-            try:
-                return await self
-            except Exception as exc:
-                result = on_rejected(exc)
-                return await ensure_awaitable(result)
+        return super().catch(exc_typ, handler)
 
-        return Promise(_exec())
-
-    catch = except_  # js-style alias
-
-    def finally_(
+    def acatch(
         self,
-        on_finally: Callable[[], MaybeCoro[None]],
+        exc_typ: type[_E] | tuple[type[_E], ...],
+        handler: AFunc1[[_E], _R],
         /,
-    ) -> Promise[_R]:
-        """The given function will be called if resolved or rejected in the
-        returned promise.
-
-        The function can be sync or async. If the wrapped coroutine is
-        cancelled or rejected with an exception that only derives from
-        BaseException, this 'finally' handler will not be called.
-        """
-        async def _exec() -> _R:
+    ) -> Promise[_T | _R]:
+        """Like .catch(), but for async handlers."""
+        async def _catch() -> _T | _R:
             try:
-                return await self
-            finally:
-                await ensure_awaitable(on_finally())
+                return await self._task
+            except exc_typ as exc:
+                return await handler(exc)
 
-        return Promise(_exec())
+        return Promise(_catch())
 
-    @property
-    def _state(self) -> PromiseState:
-        """The promise state: pending, fulfilled, rejected or cancelled."""
-        return self.__state
 
-    @property
-    def _result(self) -> _R | NoReturn:
-        """Return the result if fulfilled.
+class PromiseIterator(
+    AsyncIterator[_T],
+    Mappable[_T],
+    Catchable[_T],
+    Generic[_T],
+):
+    __slots__ = ('_iterator', '__p_next')
 
-        Raises asyncio.InvalidStateError if pending, raises
-        asyncio.CancelledError if the wrapped coro was cancelled,
-        or if the coro raised an exception, raises that.
-        """
-        return self.__result.result()
+    _iterator: AsyncIterator[_T]
+    __p_next: Promise[_T] | None
 
-    def __on_result(self, task: asyncio.Task[_R]) -> None:
-        """Internal: Done callback of the wrapped coroutine."""
-        assert task.done()
-        fut = self.__result
-        assert not fut.done()
-        assert self.__state == 'pending'
+    def __init__(self, iterator: AsyncIterator[_T], /):
+        self._iterator = iterator
+        self.__p_next = None
 
-        try:
-            result = task.result()
-        except asyncio.CancelledError as exc:
-            self.__state = CANCELLED
-            fut.cancel(exc.args[0] if exc.args else None)
-        except Exception as exc:
-            self.__state = REJECTED
-            fut.set_exception(exc)
-        except BaseException as exc:
-            self.__state = REJECTED
-            fut.set_exception(exc)
-            raise
-        else:
-            self.__state = FULFILLED
-            fut.set_result(result)
+    def __aiter__(self) -> PromiseIterator[_T]:
+        it_prev = self._iterator
+        it = it_prev.__aiter__()
+
+        if it is it_prev:
+            return self
+
+        return type(self)(it)
+
+    def __anext__(self) -> Promise[_T]:
+        if (p := self.__p_next) is None:
+            p = self.__schedule_anext()
+
+        return p
+
+    def map(self, func: Func1[_T, _R], /) -> PromiseIterator[_R]:
+        """Maps each iterated promise and returns a new PromiseIterator."""
+        return super().map(func)
+
+    def amap(self, afunc: AFunc1[_T, _R], /) -> PromiseIterator[_R]:
+        """Maps each iterated promise asynchronously, and returns a new
+        PromiseIterator."""
+        async def _ait() -> AsyncIterator[_R]:
+            async for value in self:
+                yield await afunc(value)
+
+        return PromiseIterator(_ait())
+
+    def catch(
+        self,
+        exc_typ: type[_E] | tuple[type[_E], ...],
+        handler: Func1[[_E], _R],
+        /,
+    ) -> PromiseIterator[_T | _R]:
+        """Maps the exception type to a value when raised during iteration."""
+        return super().catch(exc_typ, handler)
+
+    def acatch(
+        self,
+        exc_typ: type[_E] | tuple[type[_E], ...],
+        ahandler: AFunc1[[_E], _R],
+        /,
+    ) -> PromiseIterator[_T | _R]:
+        """Like .catch(), but for async handlers."""
+
+        async def _catcher() -> AsyncIterator[_T | _R]:
+            it = self.__aiter__()
+            __anext__ = type(it).__anext__
+            while True:
+                try:
+                    yield await __anext__(it)
+                except StopAsyncIteration:
+                    break
+                except exc_typ as exc:
+                    yield await ahandler(exc)
+
+        return PromiseIterator(_catcher())
+
+    def __schedule_anext(self) -> Promise[_T]:
+        self.__p_next = p = (
+            Promise(self._iterator.__anext__())
+            .catch(Exception, self.__on_anext_exception)
+            .map(self.__on_anext_result)
+        )
+        return p
+
+    def __on_anext_exception(self, exc: Exception) -> NoReturn:
+        if not isinstance(exc, StopAsyncIteration):
+            self.__p_next = None
+        raise exc
+
+    def __on_anext_result(self, result: _T) -> _T:
+        """Internal: result callback of the wrapped anext task."""
+        self.__p_next = None
+        return result

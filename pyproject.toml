@@ -9,12 +9,13 @@ repository = "https://github.com/jorenham/asynced"
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4"
-typing-extensions = { version = ">4.1.0", python = "<3.10" }
+typing-extensions = ">4.1.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^7.1"
 pytest-asyncio = "^0.18"
 mypy = "^0.941"
+pyright = "^1.1.231"
 
 [tool.mypy]
 python_version = "3.9"
@@ -22,6 +23,13 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 exclude = ["tests/", "examples/"]
+
+[tool.pyright]
+include = ["asynced/"]
+stubPath = ""
+venvPath = "."
+venv = ".venv/"
+pythonVersion = "3.9"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

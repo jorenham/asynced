@@ -5,19 +5,24 @@ from __future__ import annotations
 
 __all__ = (
     'resume',
+    'create_future',
+    'create_task',
     'get_event_loop',
     'ensure_awaitable',
-    'create_future',
     'ensure_acallable',
+    'wrap_async'
 )
 
 import asyncio
 import functools
 from typing import (
     Any,
+    Awaitable,
     Callable,
     cast,
     Coroutine,
+    Generator,
+    Generic,
     overload,
     TypeVar,
 )
@@ -26,12 +31,14 @@ from asynced._typing import (
     AnyCoro,
     awaitable,
     acallable,
+    DefaultCoroutine,
     Maybe,
     Nothing,
     NothingType,
 )
 
 _T = TypeVar('_T', bound=object)
+_T_co = TypeVar('_T_co', bound=object, covariant=True)
 
 
 async def resume() -> None:
@@ -62,6 +69,28 @@ def create_future(
     if exception is not Nothing:
         fut.set_exception(exception)
     return fut
+
+
+def create_task(
+    coro: Coroutine[Any, Any, _T] | asyncio.Future[_T],
+    *,
+    name: str | None = None
+) -> asyncio.Task[_T] | asyncio.Future[_T]:
+    if isinstance(coro, asyncio.Task):
+        if name and not coro.done() and coro.get_name().startswith('Task-'):
+            # only replace name if not done and it has no custom name
+            coro.set_name(name)
+        return coro
+
+    if isinstance(coro, asyncio.Future):
+        return coro
+
+    if asyncio.iscoroutine(coro):
+        _coro = coro
+    else:
+        raise TypeError(f'a coroutine was expected, got {coro!r}')
+
+    return get_event_loop().create_task(coro, name=name)
 
 
 def get_event_loop() -> asyncio.AbstractEventLoop:
@@ -96,3 +125,24 @@ def ensure_acallable(
         return await ensure_awaitable(fn(*args, **kwargs))
 
     return _wrapper
+
+
+def wrap_async(fn: Callable[..., _T]) -> Callable[..., Awaitable[_T]]:
+    @functools.wraps(fn)
+    def _fn(*args: Any, **kwargs: Any) -> CoroWrapper[_T]:
+        return CoroWrapper(fn(*args, **kwargs))
+
+    return _fn
+
+
+class CoroWrapper(DefaultCoroutine[_T_co], Generic[_T_co]):
+    __slots__ = ('__wrapped__', )
+
+    __wrapped__: _T_co
+
+    def __init__(self, value: _T_co):
+        self.__wrapped__ = value
+
+    def __await__(self) -> Generator[Any, None, _T_co]:
+        yield
+        return self.__wrapped__

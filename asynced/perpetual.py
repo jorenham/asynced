@@ -20,10 +20,10 @@ from typing import (
     Literal,
     TypeVar,
 )
+from typing_extensions import TypeAlias
 
 from ._aio_utils import get_event_loop
 from ._compat import anext, aiter
-from ._typing import TypeAlias
 
 _T = TypeVar('_T')
 _E = TypeVar('_E', bound=BaseException)
