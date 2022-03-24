@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 __all__ = (
+    'OneOrMany',
+    'ObjOrType',
+
+    'Catchable', 'CatchableE',
+    'Throwable', 'ThrowableE',
+
     'AnyCoro',
-    'MaybeCoro',
-    'Raisable',
+    'AsyncCallable',
+    'AsyncFunction',
+    'AwaitableN',
 
-    'Func0',
-    'Func1',
-    'Func2',
-
-    'AFunc0',
-    'AFunc1',
-    'AFunc2',
+    'Xsync',
+    'XsyncCallable',
 
     'DefaultCoroutine',
 
@@ -26,57 +28,68 @@ __all__ = (
 import abc
 import asyncio
 import enum
+import inspect
 from types import TracebackType
 from typing import (
     Any,
     Awaitable,
     Callable,
-    cast, Coroutine,
+    cast,
+    Coroutine,
     final,
     Final,
     Generator,
     Generic,
     Literal,
     NoReturn,
-    Protocol,
-    runtime_checkable,
+    Optional,
     TypeVar,
     Union,
 )
 
-from typing_extensions import TypeAlias, TypeGuard
+from typing_extensions import ParamSpec, TypeAlias, TypeGuard
 
 _T = TypeVar('_T')
 _T_co = TypeVar('_T_co', covariant=True)
 _T_contra = TypeVar('_T_contra', contravariant=True)
 
+_OT = TypeVar('_OT', bound=object)
+_ET = TypeVar('_ET', bound=BaseException)
+
+_P = ParamSpec('_P')
+_P0 = TypeVar('_P0')
+_P1 = TypeVar('_P1')
+
 _R = TypeVar('_R')
-_A0 = TypeVar('_A0')
-_A1 = TypeVar('_A1')
 
 # Various type aliases
 
-AnyCoro: TypeAlias = Union[Awaitable[_T], Coroutine[Any, Any, _T]]
-MaybeCoro: TypeAlias = Union[AnyCoro[_T], _T]
+OneOrMany: TypeAlias = Union[_T, tuple[_T, ...]]
+ObjOrType: TypeAlias = Union[_OT, type[_OT]]
 
-Raisable: TypeAlias = Union[type[BaseException], BaseException]
+Catchable: TypeAlias = OneOrMany[type[_ET]]
+CatchableE: TypeAlias = Catchable[type[Exception]]
 
-Func0: TypeAlias = Callable[[], _R]
-Func1: TypeAlias = Callable[[_A0], _R]
-Func2: TypeAlias = Callable[[_A0, _A1], _R]
+Throwable: TypeAlias = ObjOrType[_ET]
+ThrowableE: TypeAlias = Throwable[Exception]
 
-AFunc0: TypeAlias = Union[
-    Func0[Awaitable[_R]],
-    Func0[Coroutine[Any, Any, _R]]
+_AT1: TypeAlias = Awaitable[_T]
+_AT2: TypeAlias = _AT1[_AT1[_T]]
+_AT3: TypeAlias = _AT2[_AT1[_T]]
+_AT4: TypeAlias = _AT3[_AT1[_T]]
+_AT5: TypeAlias = _AT4[_AT1[_T]]
+
+AwaitableN: TypeAlias = Union[_AT1[_T], _AT2[_T], _AT3[_T], _AT4[_T], _AT5[_T]]
+Xsync: TypeAlias = Union[_T, AwaitableN[_T]]
+
+AnyCoro: TypeAlias = Coroutine[
+    Optional[asyncio.Future[Any]],  # .send result is a future when suspending
+    None,  # at least true for the python implementation of asyncio.Task
+    _T
 ]
-AFunc1: TypeAlias = Union[
-    Func1[_A0, Awaitable[_R]],
-    Func1[_A0, Coroutine[Any, Any, _R]]
-]
-AFunc2: TypeAlias = Union[
-    Func2[_A0, _A1, Awaitable[_R]],
-    Func2[_A0, _A1, Coroutine[Any, Any, _R]]
-]
+AsyncFunction = Callable[_P, AnyCoro[_R]]
+AsyncCallable = Callable[_P, Awaitable[_R]]
+XsyncCallable = Callable[_P, Xsync[_T]]
 
 
 # Abstract base classes
@@ -141,10 +154,13 @@ Maybe: TypeAlias = Union[_T, NothingType]
 
 def awaitable(arg: object) -> TypeGuard[Awaitable[Any]]:
     """Type guard objects that can be used in an 'await ...' expression."""
-    if hasattr(arg, '__await__'):
+    if asyncio.isfuture(arg):
         return True
 
-    return asyncio.iscoroutine(arg)
+    if hasattr(arg, '__await__') and callable(arg.__await__):
+        return True
+
+    return inspect.isawaitable(arg)
 
 
 def acallable(arg: object) -> TypeGuard[

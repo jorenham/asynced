@@ -4,19 +4,16 @@ import itertools
 from asynced import PromiseIterator
 
 
-async def exp_backoff(start: int = 0, base: float = 2, timeout: float = 60):
-    t = base ** start
-    while t < timeout:
-        await asyncio.sleep(t / 10)
-        yield t
-        t *= base
+async def arange(*args):
+    for i in range(*args):
+        yield await asyncio.sleep(0, i)
 
-    # raise asyncio.TimeoutError
 
+def exprange
 
 async def amain():
-    p = PromiseIterator(exp_backoff())
-    await asyncio.sleep(1)
+    exprange = PromiseIterator(arange()).map(lambda i: i**2)
+
     async for t in p:
         print(t)
 

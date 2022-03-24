@@ -5,45 +5,65 @@ from __future__ import annotations
 
 __all__ = (
     'resume',
+    'awaiter',
     'create_future',
     'create_task',
     'get_event_loop',
-    'ensure_awaitable',
-    'ensure_acallable',
-    'wrap_async'
+    'sync_to_async'
 )
 
 import asyncio
 import functools
 from typing import (
     Any,
-    Awaitable,
     Callable,
-    cast,
     Coroutine,
     Generator,
     Generic,
     overload,
     TypeVar,
 )
-
+from typing_extensions import ParamSpec
 from asynced._typing import (
-    AnyCoro,
+    AsyncFunction,
+    AwaitableN,
     awaitable,
-    acallable,
     DefaultCoroutine,
     Maybe,
     Nothing,
     NothingType,
+    Xsync,
 )
 
 _T = TypeVar('_T', bound=object)
 _T_co = TypeVar('_T_co', bound=object, covariant=True)
 
+_P = ParamSpec('_P')
+_R = TypeVar('_R')
 
-async def resume() -> None:
+
+async def resume(result: _T | None = None) -> None:
     """Pass control back to the event loop"""
-    await asyncio.sleep(0)
+    return await asyncio.sleep(0, result)
+
+
+async def awaiter(arg: Xsync[_T], *, max_awaits: int = 64) -> _T:
+    """For e.g. converting simple awaitables to coroutines, flattening nested
+    coros, or making a non-awaitable object awaitable."""
+    res = arg
+
+    awaits = 0
+    while awaitable(res):
+        res = await res
+
+        awaits += 1
+        if awaits >= max_awaits:
+            raise RecursionError(f'awaitables are nested >{max_awaits} deep')
+
+    if not awaits:
+        await resume()
+
+    return res
 
 
 @overload
@@ -98,39 +118,12 @@ def get_event_loop() -> asyncio.AbstractEventLoop:
     return asyncio.get_event_loop_policy().get_event_loop()
 
 
-def ensure_awaitable(obj: AnyCoro[_T] | _T, /) -> AnyCoro[_T]:
-    """Coroutines and awaitables are returned directly, otherwise a settled
-    future of the object is returned."""
-    if awaitable(obj):
-        return obj
-
-    return create_future(cast(_T, obj))
-
-
-def ensure_acallable(
-    fn: Callable[..., Coroutine[Any, Any, _T]] | Callable[..., _T],
-    /,
-) -> Callable[..., Coroutine[Any, Any, _T]]:
-    """Ensure that the callable arg returns an awaitable. Coroutine functions
-    are returned as-is.
-    """
-    if not callable(fn):
-        raise TypeError(f'{fn!r} is not callable')
-
-    if acallable(fn):
-        return fn
+def sync_to_async(fn: Callable[_P, _R]) -> AsyncFunction[_P, _R]:
+    """Create a (blocking!) async function from a sync function"""
 
     @functools.wraps(fn)
-    async def _wrapper(*args: Any, **kwargs: Any) -> _T:
-        return await ensure_awaitable(fn(*args, **kwargs))
-
-    return _wrapper
-
-
-def wrap_async(fn: Callable[..., _T]) -> Callable[..., Awaitable[_T]]:
-    @functools.wraps(fn)
-    def _fn(*args: Any, **kwargs: Any) -> CoroWrapper[_T]:
-        return CoroWrapper(fn(*args, **kwargs))
+    async def _fn(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        return await resume(fn(*args, **kwargs))
 
     return _fn
 

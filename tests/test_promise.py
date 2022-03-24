@@ -1,25 +1,17 @@
 import pytest
 
-from asynced import Promise
+from asynced import Promise, PromiseFuture
 import asyncio
 
-
-def future() -> asyncio.Future:
-    return asyncio.get_event_loop().create_future()
-
-
-def future_promise() -> tuple[asyncio.Future, Promise]:
-    fut = future()
-    return fut, Promise(fut)
+from asynced._aio_utils import create_future
 
 
 async def test_initial():
-    fut, p = future_promise()
+    pfut = PromiseFuture()
 
-    task = asyncio.create_task(p)
-
-    assert not task.done()
-    assert p.is_pending
+    assert not pfut.done()
+    with pytest.raises(asyncio.InvalidStateError):
+        pfut.result()
 
 
 async def test_resolve():
@@ -28,7 +20,8 @@ async def test_resolve():
     res = await p
     assert res == 'spam'
 
-    assert p.is_fulfilled
+    assert p.fulfilled()
+    assert p.result() == 'spam'
 
 
 async def test_reject():
@@ -39,18 +32,22 @@ async def test_reject():
 
     with pytest.raises(ZeroDivisionError):
         await p
+    with pytest.raises(ZeroDivisionError):
+        p.result()
 
-    assert p.is_rejected
+    assert p.rejected()
 
 
 async def test_cancel():
-    fut, p = future_promise()
-    fut.cancel()
+    pfut = PromiseFuture()
+    pfut.cancel()
 
     with pytest.raises(asyncio.CancelledError):
-        await p
+        await pfut
+    with pytest.raises(asyncio.CancelledError):
+        pfut.result()
 
-    assert p.is_cancelled
+    assert pfut.cancelled()
 
 
 async def test_already_resolved():
@@ -82,30 +79,32 @@ async def test_already_rejected_base_exception():
         Promise.as_rejected(asyncio.CancelledError('spam'))
 
 
-async def test_amap():
-    fut1, p1 = future_promise()
-    fut2 = future()
+async def test_then():
+    p1 = PromiseFuture()
+
+    fut = create_future()
 
     async def _mapper(_res1):
-        _res2 = await fut2
+        _res2 = await fut
         return _res1, _res2
 
-    p2 = p1.amap(_mapper)
+    p2 = p1.then(_mapper)
 
-    assert p1.is_pending
-    assert p2.is_pending
+    assert not p1.done()
+    assert not p2.done()
 
-    fut1.set_result('spam')
+    p1.fulfill('spam')
     await p1
 
-    assert p1.is_fulfilled
-    assert p2.is_pending
+    assert p1.done()
+    assert p1.fulfilled()
+    assert not p2.done()
 
-    fut2.set_result('ham')
+    fut.set_result('ham')
     await p2
 
-    assert p1.is_fulfilled
-    assert p2.is_fulfilled
+    assert p2.done()
+    assert p2.fulfilled()
 
     res1 = await p1
     res2 = await p2
@@ -120,11 +119,18 @@ async def test_catch():
     def _catch_value_error(exc):
         return exc.args[0] if exc.args else None
 
-    fut = future()
-    p = Promise(fut).map(_then).catch(ValueError, _catch_value_error)
+    p = PromiseFuture()
+    p_res = p.then(_then).catch(ValueError, _catch_value_error)
 
-    assert p.is_pending
-    fut.set_exception(ValueError('eggs'))
+    assert not p.done()
+    assert not p_res.done()
 
-    res = await p
+    p.reject(ValueError('eggs'))
+
+    with pytest.raises(ValueError):
+        await p
+
+    res = await p_res
+
     assert res == 'eggs'
+    assert p_res.result() == 'eggs'
