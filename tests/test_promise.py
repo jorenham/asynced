@@ -51,32 +51,32 @@ async def test_cancel():
 
 
 async def test_already_resolved():
-    p = Promise.as_fulfilled(42)
+    p = Promise.fulfill(42)
     res = await p
     assert res == 42
 
 
 async def test_already_rejected_exception():
-    p = Promise.as_rejected(ZeroDivisionError())
+    p = Promise.reject(ZeroDivisionError())
     with pytest.raises(ZeroDivisionError):
         await p
 
 
 async def test_already_rejected_exception_type():
-    p = Promise.as_rejected(ZeroDivisionError)
+    p = Promise.reject(ZeroDivisionError)
     with pytest.raises(ZeroDivisionError):
         await p
 
 
 async def test_already_rejected_no_exception():
     with pytest.raises(TypeError):
-        Promise.as_rejected('spam')
+        Promise.reject('spam')
 
 
 async def test_already_rejected_base_exception():
     with pytest.raises(TypeError):
         # noinspection PyAsyncCall
-        Promise.as_rejected(asyncio.CancelledError('spam'))
+        Promise.reject(asyncio.CancelledError('spam'))
 
 
 async def test_then():

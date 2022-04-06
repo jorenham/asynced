@@ -10,7 +10,12 @@ __all__ = (
     'AnyCoro',
     'AsyncCallable',
     'AsyncFunction',
+
+    'Awaitable1',
+    'Awaitable2',
+    'Awaitable3',
     'AwaitableN',
+    'AwaitableX',
 
     'Xsync',
     'XsyncCallable',
@@ -68,28 +73,23 @@ OneOrMany: TypeAlias = Union[_T, tuple[_T, ...]]
 ObjOrType: TypeAlias = Union[_OT, type[_OT]]
 
 Catchable: TypeAlias = OneOrMany[type[_ET]]
-CatchableE: TypeAlias = Catchable[type[Exception]]
+CatchableE: TypeAlias = Catchable[Exception]
 
 Throwable: TypeAlias = ObjOrType[_ET]
 ThrowableE: TypeAlias = Throwable[Exception]
 
-_AT1: TypeAlias = Awaitable[_T]
-_AT2: TypeAlias = _AT1[_AT1[_T]]
-_AT3: TypeAlias = _AT2[_AT1[_T]]
-_AT4: TypeAlias = _AT3[_AT1[_T]]
-_AT5: TypeAlias = _AT4[_AT1[_T]]
+Awaitable1: TypeAlias = Awaitable[_T]
+Awaitable2: TypeAlias = Awaitable[Awaitable[_T]]
+Awaitable3: TypeAlias = Awaitable[Awaitable[Awaitable[_T]]]
+AwaitableN: TypeAlias = Union[Awaitable1[_T], Awaitable2[_T], Awaitable3[_T]]
+AwaitableX: TypeAlias = Union[_T, Awaitable1[_T], Awaitable2[_T], Awaitable3[_T]]
 
-AwaitableN: TypeAlias = Union[_AT1[_T], _AT2[_T], _AT3[_T], _AT4[_T], _AT5[_T]]
 Xsync: TypeAlias = Union[_T, AwaitableN[_T]]
 
-AnyCoro: TypeAlias = Coroutine[
-    Optional[asyncio.Future[Any]],  # .send result is a future when suspending
-    None,  # at least true for the python implementation of asyncio.Task
-    _T
-]
-AsyncFunction = Callable[_P, AnyCoro[_R]]
-AsyncCallable = Callable[_P, Awaitable[_R]]
-XsyncCallable = Callable[_P, Xsync[_T]]
+AnyCoro: TypeAlias = Coroutine[Any, Any, _T]
+AsyncFunction: TypeAlias = Callable[_P, AnyCoro[_R]]
+AsyncCallable: TypeAlias = Callable[_P, Awaitable[_R]]
+XsyncCallable: TypeAlias = Callable[_P, Xsync[_T]]
 
 
 # Abstract base classes
@@ -152,19 +152,17 @@ Maybe: TypeAlias = Union[_T, NothingType]
 # Type guards
 
 
-def awaitable(arg: object) -> TypeGuard[Awaitable[Any]]:
+def awaitable(arg: _T) -> TypeGuard[Awaitable[_T]]:
     """Type guard objects that can be used in an 'await ...' expression."""
     if asyncio.isfuture(arg):
         return True
 
-    if hasattr(arg, '__await__') and callable(arg.__await__):
+    if callable(getattr(arg, '__await__', None)):
         return True
 
     return inspect.isawaitable(arg)
 
 
-def acallable(arg: object) -> TypeGuard[
-    Callable[..., Coroutine[Any, Any, Any]]
-]:
+def acallable(arg: Any) -> TypeGuard[Callable[..., Coroutine[Any, Any, Any]]]:
     """Type guard for coroutine (async) functions"""
     return callable(arg) and asyncio.iscoroutinefunction(arg)

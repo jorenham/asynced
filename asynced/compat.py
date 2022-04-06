@@ -1,34 +1,24 @@
 from __future__ import annotations
 
-__all__ = (
-    'PY310',
-    'PY311',
+__all__ = ('aiter', 'anext')
 
-    'aiter',
-    'anext',
-)
+import sys
 
 from typing import (
-    Any,
     AsyncIterable,
     AsyncIterator,
     Awaitable,
-    Callable, cast, Coroutine,
-    Final,
-    Final,
+    Callable,
+    cast,
     overload,
     TypeVar,
 )
-import sys
+
 from ._typing import Maybe, Nothing
 
-
 _T = TypeVar('_T')
-_VT = TypeVar('_VT')
-
-
-PY310: Final[bool] = sys.version_info >= (3, 10)
-PY311: Final[bool] = sys.version_info >= (3, 11)
+_T1 = TypeVar('_T1')
+_T2 = TypeVar('_T2')
 
 
 def py_aiter(iterable: AsyncIterable[_T]) -> AsyncIterator[_T]:
@@ -44,31 +34,32 @@ def py_aiter(iterable: AsyncIterable[_T]) -> AsyncIterator[_T]:
 @overload
 async def py_anext(__i: AsyncIterator[_T]) -> _T: ...
 @overload
-async def py_anext(__i: AsyncIterator[_T], default: _VT) -> _T | _VT: ...
+async def py_anext(__i: AsyncIterator[_T1], default: _T2) -> _T1 | _T2: ...
 
 
 def py_anext(
-    iterator: AsyncIterator[_T],
-    default: Maybe[_VT] = Nothing,
-) -> Awaitable[_T | _VT]:
+    iterator: AsyncIterator[_T1],
+    default: Maybe[_T2] = Nothing,
+) -> Awaitable[_T1 | _T2]:
     """Pure-python backport of the builtin anext() from 3.10.
 
     Based on py_anext from
     https://github.com/python/cpython/blob/3.10/Lib/test/test_asyncgen.py
     """
     try:
-        __anext__: Callable[[AsyncIterator[_T]], Awaitable[_T]] = type(iterator).__anext__
+        __anext__: Callable[[AsyncIterator[_T]], Awaitable[_T]]
+        __anext__ = type(iterator).__anext__
     except AttributeError:
         raise TypeError(f'{iterator!r} is not an async iterator')
 
     if default is Nothing:
         return __anext__(iterator)
 
-    async def anext_impl() -> _T | _VT:
+    async def anext_impl() -> _T1 | _T2:
         try:
             return await __anext__(iterator)
         except StopAsyncIteration:
-            return cast(_VT, default)
+            return cast(_T2, default)
 
     return anext_impl()
 
