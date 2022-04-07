@@ -10,9 +10,8 @@ from asynced.compat import anext, aiter
 DT: Final[float] = .01
 
 
-@pytest.fixture(scope='module', autouse=True)
+@pytest.fixture(scope='function', autouse=True)
 def timeout_1s():
-    # You can do whatever you need here, just return/yield a number
     return 1.0
 
 

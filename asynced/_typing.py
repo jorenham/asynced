@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 __all__ = (
+    'EllipsisType',
+
     'OneOrMany',
     'ObjOrType',
 
@@ -47,7 +49,6 @@ from typing import (
     Generic,
     Literal,
     NoReturn,
-    Optional,
     TypeVar,
     Union,
 )
@@ -68,6 +69,8 @@ _P1 = TypeVar('_P1')
 _R = TypeVar('_R')
 
 # Various type aliases
+
+EllipsisType = type(Ellipsis)
 
 OneOrMany: TypeAlias = Union[_T, tuple[_T, ...]]
 ObjOrType: TypeAlias = Union[_OT, type[_OT]]

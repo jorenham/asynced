@@ -8,7 +8,8 @@ import collections
 import inspect
 import sys
 from typing import (
-    Any, AsyncIterable,
+    Any,
+    AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -16,11 +17,13 @@ from typing import (
     Generator,
     Generic,
     Hashable,
+    Iterable,
     Literal,
     NoReturn,
     overload,
     Sequence,
-    SupportsIndex, TypeVar,
+    SupportsIndex,
+    TypeVar,
 )
 from typing_extensions import TypeAlias
 
@@ -53,6 +56,10 @@ class _PredicatesMixin:
     _predicates: dict[str, AwaitablePredicate]
 
     @property
+    def is_set(self) -> AwaitablePredicate:
+        return self._predicates['set']
+
+    @property
     def is_done(self) -> AwaitablePredicate:
         return self._predicates['done']
 
@@ -60,10 +67,6 @@ class _PredicatesMixin:
     def is_stopped(self) -> AwaitablePredicate:
         """StopIteration or StopAsyncIteration was raised"""
         return self._predicates['stop']
-
-    @property
-    def is_set(self) -> AwaitablePredicate:
-        return self._predicates['set']
 
     @property
     def is_error(self) -> AwaitablePredicate:
@@ -80,7 +83,7 @@ class _PredicatesMixin:
                 predicate.set(value)
 
     @abc.abstractmethod
-    def _on_set(self, _: _S): ...
+    def _on_set(self): ...
     @abc.abstractmethod
     def _on_error(self, exc: BaseException): ...
     @abc.abstractmethod
@@ -101,7 +104,7 @@ class _PredicatesMixin:
             else:
                 self._on_error(exc)
         else:
-            self._on_set(future.result())
+            self._on_set()
 
 
 class StateValue(_PredicatesMixin, SimpleStateValue[_S], Generic[_S]):
@@ -117,21 +120,21 @@ class StateValue(_PredicatesMixin, SimpleStateValue[_S], Generic[_S]):
 
         super().__init__(coro)
 
-    def _on_done(self, key: Literal['set', 'error', 'cancel', 'stop']) -> None:
-        keys = ['set', 'stop', 'error', 'cancel']
-        self._set_predicate(done=True, **{k: k == key for k in keys})
-
-    def _on_set(self, _: _S):
-        self._on_done('set')
+    def _on_set(self):
+        self.__on_done('set')
 
     def _on_stop(self):
-        self._on_done('stop')
+        self.__on_done('stop')
 
     def _on_error(self, exc: BaseException):
-        self._on_done('error')
+        self.__on_done('error')
 
     def _on_cancel(self):
-        self._on_done('cancel')
+        self.__on_done('cancel')
+
+    def __on_done(self, key: Literal['set', 'error', 'cancel', 'stop']) -> None:
+        keys = ['set', 'stop', 'error', 'cancel']
+        self._set_predicate(done=True, **{k: k == key for k in keys})
 
 
 class StateVarBase(
@@ -365,7 +368,7 @@ class StateVarBase(
         return egg
 
     @abc.abstractmethod
-    def _on_set(self, _: _S): ...
+    def _on_set(self): ...
     @abc.abstractmethod
     def _on_stop(self): ...
     @abc.abstractmethod
@@ -385,9 +388,9 @@ class StateVar(StateVarBase[_S], _PredicatesMixin, Generic[_S]):
             async for state in self:
                 yield state[i]
 
-        return StateVarTuple(*(producer(i) for i in range(n)))
+        return StateVarTuple(map(producer, range(n)))
 
-    def _on_set(self, _: _S):
+    def _on_set(self):
         self._set_predicate(set=True)
 
     def _on_error(self, exc: BaseException):
@@ -411,19 +414,20 @@ class StateVarTuple(
 
     def __init__(
         self,
-        *producers: StateVarBase[_S] | AsyncIterable[_S],
+        producers: int | Iterable[StateVarBase[_S] | AsyncIterable[_S]],
+        statevar_type: type[StateVarBase] = StateVar
     ) -> None:
-        if not producers:
-            raise TypeError('StateVarTuple() must have at least one argument.')
-
-        items = []
-        for i, producer in enumerate(producers):
-            if isinstance(producer, StateVarBase):
-                items.append(producer)
-            else:
-                items.append(StateVar(producer))
-
-        self._statevars = tuple(items)
+        if isinstance(producers, int):
+            self._statevars = tuple(
+                statevar_type() for _ in range(producers)
+            )
+        else:
+            self._statevars = tuple(
+                prod if isinstance(prod, StateVarBase) else statevar_type(prod)
+                for prod in producers
+            )
+        if not self._statevars:
+            raise TypeError('StateVarTuple() must have at least one producer.')
 
         super().__init__(self._get_producer())
 
@@ -431,13 +435,21 @@ class StateVarTuple(
         return self._gather().__await__()
 
     @overload
-    def __getitem__(self, i: int) -> StateVar[_S]: ...
+    def __getitem__(self, i: int) -> StateVarBase[_S]: ...
 
     @overload
     def __getitem__(self, s: slice) -> StateVarTuple[_S]: ...
 
-    def __getitem__(self, i: int | slice) -> StateVar[_S] | StateVarTuple[_S]:
-        return self._statevars[i]
+    def __getitem__(self, i: int | slice) -> StateVarBase[_S]:
+        if isinstance(i, int):
+            return self._statevars[i]
+        elif isinstance(i, slice):
+            return type(self)(self._statevars[i])
+        else:
+            raise TypeError(
+                f'{type(self).__name__} indices must be integers or slices, '
+                f'not {type(i).__name__}'
+            )
 
     def __setitem__(self, i: int, state: _S) -> None:
         self._statevars[i].set(state)
@@ -452,9 +464,62 @@ class StateVarTuple(
     def __len__(self) -> int:
         return len(self._statevars)
 
+    def __reversed__(self) -> StateVarTuple[_S]:
+        return self[::-1]
+
+    def __add__(self, other: StateVarTuple[_S]):
+        cls = type(self)
+        if not isinstance(other, StateVarTuple):
+
+            raise TypeError(
+                f'can only concatenate {cls.__name__} (not '
+                f'{type(other).__name__!r}) to {cls.__name__}'
+            )
+
+        return cls(self._statevars + other._statevars)
+
+    def __mul__(self, value: int) -> StateVarTuple[_S]:
+        """Return self * value"""
+        if not isinstance(value, int):
+            raise TypeError(
+                f'can\'t multiply {type(self).__name__} by non-int of type '
+                f'{type(value).__name__}'
+            )
+        return type(self)(self._statevars * value)
+
+    def __rmul__(self, value: int) -> StateVarTuple[_S]:
+        """Return value * self"""
+        return self.__mul__(value)
+
+    def __hash__(self) -> int:
+        return hash(self._statevars)
+
     @property
     def readonly(self) -> bool:
+        """.set() cannot be used, but unless the statevar items are readable,
+        they can be set with e.g. self[0] = ...
+        """
         return True
+
+    @property
+    def all_set(self) -> AwaitablePredicate:
+        return self._predicates['n_set']
+
+    @property
+    def all_done(self) -> AwaitablePredicate:
+        return self._predicates['n_done']
+
+    @property
+    def all_stopped(self) -> AwaitablePredicate:
+        return self._predicates['n_stop']
+
+    @property
+    def all_error(self) -> AwaitablePredicate:
+        return self._predicates['n_error']
+
+    @property
+    def all_cancelled(self) -> AwaitablePredicate:
+        return self._predicates['n_cancel']
 
     def get(self, default: Maybe[_T] = Nothing) -> tuple[_S | _T, ...]:
         return tuple(sv.get(default) for sv in self._statevars)
@@ -479,17 +544,54 @@ class StateVarTuple(
             states = states[0:i] + (state, ) + states[i+1:]
             yield states
 
-    def _on_set(self, _: _S):
-        # TODO all_set
+    def _on_set(self):
+        if self._predicates['n_set'].as_future().done():
+            return
+
         self._set_predicate(set=True)
 
+        if (n_set := self.__is_all_predicates('set')) is not None:
+            self._set_predicate(n_set=n_set)
+
     def _on_stop(self):
-        # TODO all_stopped
-        self._set_predicate(done=True, error=False, cancel=False, stop=True)
+        self._set_predicate(stop=True)
+
+        if (n_stop := self.__is_all_predicates('stop')) is not None:
+            self._set_predicate(n_error=False, n_cancel=False, n_stop=n_stop)
+            self.__on_all_done()
 
     def _on_error(self, exc: BaseException):
-        self._set_predicate(done=True, error=True, cancel=False, stop=False)
+        self._set_predicate(error=True)
+
+        if (n_error := self.__is_all_predicates('error')) is not None:
+            self._set_predicate(n_error=n_error, n_cancel=False, n_stop=False)
+            self.__on_all_done()
 
     def _on_cancel(self):
-        # TODO all_cancelled
-        self._set_predicate(done=True, error=False, cancel=True, stop=False)
+        self._set_predicate(cancel=True)
+
+        if (n_cancel := self.__is_all_predicates('cancel')) is not None:
+            self._set_predicate(n_error=False, n_cancel=n_cancel, n_stop=False)
+            self.__on_all_done()
+
+    def __on_all_done(self):
+        self._set_predicate(n_done=True)
+        if not self._predicates['n_set'].as_future().done():
+            self._set_predicate(n_set=False)
+
+    def __is_all_predicates(self, key: str) -> bool | None:
+        is_all = True
+        for statevar in self:
+            # noinspection PyProtectedMember
+            predicates = statevar._predicates
+            if key not in predicates:
+                return None
+
+            predicate = predicates[key]
+            future = predicate.as_future()
+            if not future.done():
+                return None
+
+            is_all = is_all and future.result()
+
+        return is_all
