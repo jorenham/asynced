@@ -1,43 +1,33 @@
 from __future__ import annotations
 
-from asynced import StateVar
-from asynced.exceptions import StopAnyIteration
-
-"""Various async(io)-related utility functions"""
-
+import functools
 
 __all__ = (
-    'resume',
-    'awaiter',
     'race',
+    'resume',
+
+    'get_event_loop',
+    'call_soon',
+    'call_soon_task',
     'create_future',
     'create_task',
-    'get_event_loop',
-    'sync_to_async'
 )
 
 import asyncio
-import functools
+
 from typing import (
     Any,
-    AsyncIterable, AsyncIterator, Awaitable,
+    AsyncIterable,
+    AsyncIterator,
     Callable,
-    cast,
     Coroutine,
-    Generator,
-    Generic,
     overload,
     TypeVar,
 )
 from typing_extensions import ParamSpec
-from asynced._typing import (
-    AsyncFunction,
-    awaitable,
-    DefaultCoroutine,
-    Maybe,
-    Nothing,
-    NothingType,
-)
+
+from asynced._typing import Maybe, Nothing, NothingType
+from asynced.compat import anext, aiter
 
 _T = TypeVar('_T')
 _T_co = TypeVar('_T_co', covariant=True)
@@ -55,23 +45,6 @@ async def resume(result: _T = ...) -> _T: ...
 async def resume(result: _T | None = None) -> _T | None:
     """Pass control back to the event loop"""
     return await asyncio.sleep(0, result)
-
-
-async def awaiter(
-    arg: Awaitable[Awaitable[_T]] | Awaitable[_T] | _T,
-    *,
-    max_awaits: int = 4
-) -> _T:
-    """For e.g. converting simple awaitables to coroutines, flattening nested
-    coros, or making a non-awaitable object awaitable."""
-
-    if max_awaits <= 0:
-        raise RecursionError(f'max recursion depth reached in nested awaitable')
-
-    if not awaitable(arg):
-        return cast(_T, arg)
-
-    return await awaiter(await arg, max_awaits=max_awaits-1)
 
 
 async def race(
@@ -144,6 +117,59 @@ def create_future(
 ) -> asyncio.Future[Any]: ...
 
 
+def call_soon(
+    callback: Callable[_P, _R],
+    *args: _P.args,
+    **kwargs: _P.kwargs
+) -> asyncio.Handle:
+    """Like asyncio.get_event_loop().call_soon(), but accepts keyword args."""
+    return get_event_loop().call_soon(
+        functools.partial(callback, *args, **kwargs)
+    )
+
+
+def call_soon_task(
+    callback: Callable[_P, _R],
+    *args: _P.args,
+    **kwargs: _P.kwargs
+) -> asyncio.Task[_R]:
+    """Like asyncio.get_event_loop().call_soon(), but returns an asyncio.Task
+    instead of asyncio.Handle
+    """
+    loop = get_event_loop()
+    future = loop.create_future()
+
+    def callback_wrapper():
+        try:
+            result = callback(*args, **kwargs)
+            future.set_result(result)
+        except asyncio.CancelledError:
+            future.cancel()
+            handle.cancel()
+            raise
+        except BaseException as exc:
+            future.set_exception(exc)
+            raise
+
+        return result
+
+    async def handle_watcher():
+        while not handle.cancelled():
+            if future.done():
+                return future.result()
+
+            try:
+                return await asyncio.wait_for(asyncio.shield(future), 0.1)
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0)
+
+        assert handle.cancelled()
+        raise asyncio.CancelledError()
+
+    handle = loop.call_soon(callback_wrapper)
+    return asyncio.create_task(handle_watcher())
+
+
 def create_future(
     result: Maybe[_T] = Nothing,
     exception: Maybe[BaseException] = Nothing
@@ -179,42 +205,3 @@ def create_task(
 def get_event_loop() -> asyncio.AbstractEventLoop:
     """Return the running event loop if exists, otherwise creates a new one."""
     return asyncio.get_event_loop_policy().get_event_loop()
-
-
-def sync_to_async(fn: Callable[_P, _R]) -> AsyncFunction[_P, _R]:
-    """Create a (blocking!) async function from a sync function"""
-
-    loop = get_event_loop()
-
-    def _fn(
-        fut: asyncio.Future[_R],
-        args: _P.args,
-        kwargs: _P.kwargs
-    ) -> None:
-        try:
-            res = fn(*args, **kwargs)
-        except Exception as e:
-            fut.set_exception(e)
-        else:
-            fut.set_result(res)
-
-    @functools.wraps(fn)
-    async def _afn(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-        fut = loop.create_future()
-        loop.call_soon(_fn, fut, args, kwargs)
-        return await fut
-
-    return _afn
-
-
-class CoroWrapper(DefaultCoroutine[_T_co], Generic[_T_co]):
-    __slots__ = ('__wrapped__', )
-
-    __wrapped__: _T_co
-
-    def __init__(self, value: _T_co):
-        self.__wrapped__ = value
-
-    def __await__(self) -> Generator[Any, None, _T_co]:
-        yield
-        return self.__wrapped__

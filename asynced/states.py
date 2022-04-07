@@ -1,280 +1,145 @@
 from __future__ import annotations
 
-__all__ = (
-    'StateError',
-    'StateVar',
-
-    'statezip',
-)
+__all__ = ('StateVar', 'StateVarTuple')
 
 import abc
 import asyncio
-import functools
+import collections
 import inspect
 from typing import (
-    Any,
-    AsyncIterable,
+    Any, AsyncIterable,
     AsyncIterator,
-    Awaitable,
-    Callable,
-    Coroutine,
-    Final, Generator,
+    Awaitable, Callable, Coroutine, Generator,
     Generic,
     Hashable,
+    Literal,
+    NoReturn,
     overload,
-    Protocol,
+    Sequence,
     TypeVar,
-    Union,
 )
+from typing_extensions import Self, TypeAlias
 
-from typing_extensions import ParamSpec, TypeAlias
-
-from ._aio_utils import get_event_loop
+from ._states import SimpleStateBase, SimpleStateValue
 from ._typing import Maybe, Nothing
-from .abuiltins import aiter, anext
-
+from .asyncio_utils import create_future, race
+from .exceptions import StateError, StopAnyIteration
 
 _T = TypeVar('_T')
-_VT = TypeVar('_VT')
-_RT = TypeVar('_RT')
 
 _S = TypeVar('_S', bound=Hashable)
 _RS = TypeVar('_RS', bound=Hashable)
 
-_P = ParamSpec('_P')
+
+AwaitablePredicate: TypeAlias = SimpleStateValue[bool]
 
 
-_FutureOrCoro: TypeAlias = Union[asyncio.Future[_T], Coroutine[Any, Any, _T]]
-_MaybeAsync: TypeAlias = Union[Callable[_P, _T], Callable[_P, Awaitable[_T]]]
-
-
-class _AlwaysAsync(_Fn[_VT, _T], Generic[_VT, _T]):
-    __slots__ = ('__wrapped__', '__name__', 'is_async')
-
-    __wrapped__: _Fn[_VT, _T] | _Fn[_VT, Awaitable[_T]]
-    is_async: bool | None
-
-    def __init__(self, func: _Fn[_VT, _T] | _Fn[_VT, Awaitable[_T]]) -> None:
-        self.__wrapped__ = func
-        self.__name__ = func.__name__
-
-        self.is_async = asyncio.iscoroutinefunction(func) or None
-
-    async def __call__(self, *args: _VT) -> _T:
-        res = self.__wrapped__(*args)
-        if (is_async := self.is_async) is None:
-            is_async = self.is_async = inspect.isawaitable(res)
-
-        return (await res) if is_async else res
-
-
-@functools.cache
-def _get_loop() -> asyncio.AbstractEventLoop:
-    return get_event_loop()
-
-
-def _create_future(
-    coro: Maybe[_FutureOrCoro[_S]] = Nothing,
-) -> asyncio.Future[_S]:
-    if coro is Nothing:
-        return _get_loop().create_future()
-    elif isinstance(coro, asyncio.Future):
-        return coro
-    elif inspect.isawaitable(coro):
-        return asyncio.create_task(coro)
-    else:
-        raise TypeError(f'a future or coroutine was expected, got {coro!r}')
-
-
-class StateError(asyncio.InvalidStateError):
-    pass
-
-
-class SimpleStateBase(Awaitable[_S], Generic[_S]):
-    __slots__ = ()
-
-    @abc.abstractmethod
-    def __await__(self) -> Generator[Any, None, _S]:
-        ...
-
-    @abc.abstractmethod
-    def set(self, state: _S):
-        ...
-
-    @abc.abstractmethod
-    def _get_future(self) -> asyncio.Future[_S]:
-        ...
+class _PredicatesMixin:
+    _predicates: dict[str, AwaitablePredicate]
 
     @property
-    def _raw_value(self) -> _S | BaseException | None:
-        """For pattern matching."""
-        fut = self._get_future()
-        if not fut.done():
-            return None
-        try:
-            return fut.result()
-        except BaseException as exc:
-            return exc
-
-    def __await__(self) -> Generator[Any, None, _S]:
-        return self._get_future().__await__()
-
-    def __bool__(self) -> bool:
-        return bool(self._raw_value)
-
-    def __repr__(self) -> str:
-        return f'<{type(self).__name__}{self._format()} at {id(self):#x}>'
-
-    def __str__(self) -> str:
-        return f'<{type(self).__name__}{self._format()}>'
-
-    # State information
+    def is_done(self) -> AwaitablePredicate:
+        return self._predicates['done']
 
     @property
-    def readonly(self) -> bool:
-        """Returns true if the state value has a coro or task that will set the
-        value in the future.
-        """
-        return isinstance(self._get_future(), asyncio.Task)
+    def is_set(self) -> AwaitablePredicate:
+        return self._predicates['set']
 
-    # Setter
+    @property
+    def is_error(self) -> AwaitablePredicate:
+        return self._predicates['error']
 
-    def set(self, state: _S) -> None:
-        fut = self._get_future()
+    @property
+    def is_cancelled(self) -> AwaitablePredicate:
+        return self._predicates['cancel']
 
-        if fut.done():
-            # ensure any set exceptions are raised if, or if cancelled,
-            # asyncio.CancelledError is raised
-            _state = fut.result()
+    @property
+    def is_stopped(self) -> AwaitablePredicate:
+        """StopIteration or StopAsyncIteration was raised"""
+        return self._predicates['stop']
 
-            # otherwise, it's already set, which can only be done once
-            raise StateError(f'state value is already set: {_state.result()!r}')
-
-        elif isinstance(fut, asyncio.Task):
-            raise StateError(
-                f'state value is readonly: it will be set from its coroutine: '
-                f'{fut.get_coro()!r}'
-            )
-
-        fut.set_result(state)
-
-    # Internal methods
-
-    def _format(self) -> str:
-        fut = self._get_future()
-
-        if fut.done():
-            return f'({self._raw_value!r})'
-
-        return f'({fut!r})'
-
-
-class SimpleStateValue(SimpleStateBase[_S], Generic[_S]):
-    __slots__ = ('_future', )
-
-    _future: asyncio.Future[_S]
-
-    def __init__(self, coro: Maybe[_FutureOrCoro[_S]] = Nothing) -> None:
-        self._future = _create_future(coro)
-
-    def _get_future(self) -> asyncio.Future[_S]:
-        return self._future
-
-
-class StateBase(SimpleStateBase[_S], Generic[_S]):
-    __slots__ = (
-        'is_done',
-        'is_set',
-        'is_cancelled',
-        'is_error',
-    )
-
-    is_done: Final[SimpleStateValue[bool]]
-    is_set: Final[SimpleStateValue[bool]]
-    is_cancelled: Final[SimpleStateValue[bool]]
-    is_error: Final[SimpleStateValue[bool]]
-
-    def __init__(self) -> None:
-        self.is_done = SimpleStateValue(self._once_done())
-        self.is_set = SimpleStateValue(self._once_set())
-        self.is_cancelled = SimpleStateValue(self._once_cancelled())
-        self.is_error = SimpleStateValue(self._once_error())
-
-    def __setattr__(self, key: str, value: Any):
-        if hasattr(self, key) and key in StateBase.__slots__:
-            raise AttributeError(f'can\'t set state attribute {key}')
-        super().__setattr__(key, value)
+    def _set_predicate(self, **kwargs: bool) -> None:
+        for key, value in kwargs.items():
+            predicate = self._predicates[key]
+            if not predicate.as_future().done():
+                predicate.set(value)
 
     @abc.abstractmethod
-    def _get_future(self) -> asyncio.Future[_S]:
-        ...
+    def _on_set(self, _: _S): ...
+    @abc.abstractmethod
+    def _on_error(self, exc: BaseException): ...
+    @abc.abstractmethod
+    def _on_cancel(self): ...
+    @abc.abstractmethod
+    def _on_stop(self): ...
 
-    async def _wait_for_future_state(
-        self,
-        result: bool,
-        cancelled: bool,
-        error: bool,
-        stopped: bool | None = None,
-        future: asyncio.Future[_S] | None = None
-    ) -> bool:
-        if future is None:
-            future = self._get_future()
-        try:
-            await future
-        except (SystemExit, KeyboardInterrupt):
-            raise
-        except asyncio.CancelledError:
-            return cancelled
-        except (StopIteration, StopAsyncIteration):
-            return error if stopped is None else None
-        except BaseException:  # noqa
-            return error
+    def _update(self, future: asyncio.Future[_S]) -> None:
+        assert future.done()
+
+        if future.cancelled():
+            self._on_cancel()
+        elif (exc := future.exception()) is not None:
+            if isinstance(exc, asyncio.CancelledError):
+                self._on_cancel()
+            elif isinstance(exc, StopAnyIteration):
+                self._on_stop()
+            else:
+                self._on_error(exc)
         else:
-            return result
-
-    async def _once_done(self) -> bool:
-        return await self._wait_for_future_state(True, True, True)
-
-    async def _once_set(self) -> bool:
-        return await self._wait_for_future_state(True, False, False)
-
-    async def _once_cancelled(self) -> bool:
-        return await self._wait_for_future_state(False, True, False)
-
-    async def _once_error(self) -> bool:
-        return await self._wait_for_future_state(False, False, True)
+            self._on_set(future.result())
 
 
-class StateValue(StateBase[_S], Generic[_S]):
-    __slots__ = ('_future',)
+class StateValue(_PredicatesMixin, SimpleStateValue[_S], Generic[_S]):
+    __slots__ = ('_predicates', )
 
-    _future: asyncio.Future[_S]
+    _predicates: dict[str, AwaitablePredicate]
 
-    def __init__(self, coro: Maybe[_FutureOrCoro[_S]] = Nothing) -> None:
-        self._future = _create_future(coro)
-        super().__init__()
+    def __init__(
+        self,
+        coro: Maybe[asyncio.Future[_T] | Coroutine[Any, Any, _T]] = Nothing
+    ) -> None:
+        self._predicates = collections.defaultdict(SimpleStateValue)
 
-    def _get_future(self) -> asyncio.Future[_S]:
-        return self._future
+        super().__init__(coro)
+
+    def _on_done(self, key: Literal['set', 'error', 'cancel', 'stop']) -> None:
+        keys = ['set', 'stop', 'error', 'cancel']
+        self._set_predicate(done=True, **{k: k == key for k in keys})
+
+    def _on_set(self, _: _S):
+        self._on_done('set')
+
+    def _on_stop(self):
+        self._on_done('stop')
+
+    def _on_error(self, exc: BaseException):
+        self._on_done('error')
+
+    def _on_cancel(self):
+        self._on_done('cancel')
 
 
-class StateVar(AsyncIterator[_S], StateBase[_S], Generic[_S]):
-    __slots__ = (
-        'is_finished',
+class StateVarBase(
+    _PredicatesMixin,
+    AsyncIterator[_S],
+    SimpleStateBase[_S],
+    Generic[_S]
+):
+    __slots__ = ('_producer', '_value', '_value_next', '_predicates')
 
-        '_producer',
-        '_value',
-        '_value_next',
-    )
+    _predicates: dict[str, AwaitablePredicate]
 
     _producer: Maybe[AsyncIterator[_S]]
 
     _value: StateValue[_S]
     _value_next: StateValue[_S]
 
-    is_finished: Final[SimpleStateValue[bool]]
+    def __init__(
+        self,
+        producer: Maybe[StateVarBase[_S] | AsyncIterable[_S]] = Nothing
+    ) -> None:
+        self._predicates = collections.defaultdict(SimpleStateValue)
 
-    def __init__(self, producer: Maybe[AsyncIterable[_S]] = Nothing) -> None:
         if producer is not Nothing:
             producer = producer.__aiter__()
         self._producer = producer
@@ -283,21 +148,19 @@ class StateVar(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
         super().__init__()
 
-        self.is_finished = SimpleStateValue(self._once_finished())
-
     def __await__(self) -> Generator[Any, None, _S]:
         return self._value.__await__()
 
     def __aiter__(self: _S) -> AsyncIterator[_S]:
         async def _aiter():
             try:
-                yield await self._value
+                yield await self
 
                 while True:
                     yield await self._value_next
 
             except (StopAsyncIteration, asyncio.CancelledError):
-                pass  #
+                pass
 
         return _aiter()
 
@@ -307,25 +170,38 @@ class StateVar(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         except asyncio.CancelledError:
             raise StopAsyncIteration
 
-    def next(self) -> StateVar[_S]:
-        """Returns a statevar that has no value set yet, so that awaiting it
+    def as_future(self) -> asyncio.Future[_S]:
+        return self._value_next.as_future()
+
+    def get(self, default: Maybe[_T] = Nothing) -> _S | _T:
+        """Return the current state value.
+
+        If not set, the method will return the default value of the `default`
+        argument of the method, if provided; or raise a LookupError.
+        """
+        fut = self._value.as_future()
+        if fut.done():
+            try:
+                return fut.result()
+            except (StopAsyncIteration, asyncio.CancelledError):
+                if default is not Nothing:
+                    return default
+                raise
+
+        if default is not Nothing:
+            return default
+        raise LookupError(repr(self))
+
+    def next(self) -> StateValue[_S]:
+        """Returns a state value that has no value set yet, so that awaiting it
         will return when the next / future state is set.
 
         If currently there is no value, this state variable is returned,
         otherwise a new state variable
         """
-        if self._value_next.is_done:
-            self._get_future().result()  # noqa
-
-        async def producer():
-            await self._value
-            while True:
-                try:
-                    yield await self._value_next
-                except StopAsyncIteration:
-                    break
-
-        return StateVar(producer())
+        if not self._value.as_future().done():
+            return self._value
+        return self._value_next
 
     def set(self, state: _S) -> bool:
         """Set the new state. If the state is equal to the current state,
@@ -340,7 +216,7 @@ class StateVar(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             raise TypeError('cannot set state to nothing')
         if self.readonly:
             raise StateError(f'{self!r} is read-only')
-        if self.is_done:
+        if self._value_next.is_done:
             raise StateError(f'{self!r} is done')
 
         value, value_next = self._value, self._value_next
@@ -355,91 +231,27 @@ class StateVar(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         value_next.set(state)
         self._value = value_next
 
+        self._update(value_next.as_future())
+
         return True
 
-    # Chaining methods
-
-    def map(self, function: _MaybeAsync[[_S], _RS]) -> StateVar[_RS]:
-        """Alias of ``statemap(function, self)``"""
-
-        afunction: Callable[[_S], Awaitable[_RS]] = _AlwaysAsync(function)
-
-        async def producer() -> AsyncIterator[_RS]:
-            async for state in self:
-                yield await afunction(state)
-
-        return StateVar(producer())
-
-    def filter(
+    def map(
         self,
-        function: _Fn[_S, bool] | _Fn[_S, Awaitable[bool]]
-    ) -> StateVar[_S]:
-        afunction: Callable[[_S], Awaitable[_RS]] = _AlwaysAsync(function)
-
-        async def producer() -> AsyncIterator[_RS]:
-            async for state in self:
-                if await afunction(state):
-                    yield state
-
-        return StateVar(producer())
-
-    @overload
-    def reduce(
-        self,
-        function: _MaybeAsync[[_RS, _S], _RS],
-        initial: _RS,
+        function: Callable[[_S], _RS] | Callable[[_S], Awaitable[_RS]],
     ) -> StateVar[_RS]:
-        ...
+        async def producer() -> AsyncIterator[_RS]:
+            is_async = None
+            if asyncio.iscoroutinefunction(function):
+                is_async = True
 
-    @overload
-    def reduce(
-        self,
-        function: _MaybeAsync[[_S, _S], _S],
-    ) -> StateVar[_S]:
-        ...
+            async for state in self:
+                res = function(state)
+                if is_async is None:
+                    is_async = inspect.isawaitable(res)
 
-    def reduce(
-        self,
-        function: _MaybeAsync[[_S, _S], _S] | _MaybeAsync[[_RS, _S], _RS],
-        initial: Maybe[_RS] = Nothing,
-    ) -> StateVar[_RS] | StateVar[_S]:
-        """Statevar analogue of functools.reduce."""
-        afunction: Callable[[_S], Awaitable[_RS]] = _AlwaysAsync(function)
+                yield (await res) if is_async else res
 
-        async def _reduce() -> AsyncIterator[_RS]:
-            it = aiter(self)
-
-            if initial is Nothing:
-                try:
-                    res = await anext(it)
-                except StopAsyncIteration:
-                    return
-            else:
-                res = initial
-
-            yield res
-
-            async for state in it:
-                res = await afunction(res, state)
-                yield res
-
-        return StateVar(_reduce())
-
-    def _get_future(self) -> asyncio.Future[_S]:
-        # noinspection PyProtectedMember
-        return self._value_next._get_future()
-
-    async def _once_done(self) -> bool:
-        return await self._wait_for_future_state(False, True, True)
-
-    async def _once_set(self) -> bool:
-        return await self._value.is_set
-
-    async def _once_error(self) -> bool:
-        return await self._wait_for_future_state(False, False, True, False)
-
-    async def _once_finished(self) -> bool:
-        return await self._wait_for_future_state(False, False, False, True)
+        return type(self)(producer())
 
     def _format(self) -> str:
         # noinspection PyProtectedMember
@@ -454,7 +266,9 @@ class StateVar(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
         # Chicken & Egg Problem: Solved
         feathery_wormhole: asyncio.Future[StateValue[_S]]
-        feathery_wormhole = _create_future()
+        feathery_wormhole = create_future()
+
+        loop = asyncio.get_running_loop()
 
         async def _hatch():
             # Wait for the egg, but don't touch it! Unless you want spacetime
@@ -463,33 +277,154 @@ class StateVar(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
             try:
                 chick: _S = await self._producer.__anext__()
-            except (StopIteration, StopAsyncIteration, asyncio.CancelledError):
-                # "acceptable" exit condition, RIP :(
-                pass
+            except (StopAsyncIteration, asyncio.CancelledError):
+                # The chicken mom went to the ctrl+Z clinic
+                raise
             except (KeyboardInterrupt, SystemExit):
                 # Universe is imploding; raise ASAP
                 raise
             except BaseException:  # noqa
                 # *The egg is a Lie* - make both __await__ and __anext__ raise
                 self._value = interdimensional_egg
+                raise
             else:
                 # success! what was the future is now the present, and the
                 # future is beyond the future of the past
                 assert self._value_next is interdimensional_egg
 
                 # repeat and rinse (:
-                _get_loop().call_soon(self.__schedule_next)
-
-                # he'll hatch soon, so let's put it in the right place
-                self._value = interdimensional_egg
+                try:
+                    loop.call_soon(self.__schedule_next)
+                except RuntimeError:
+                    pass
 
                 return chick
                 # the interdimensional egg is hatched
 
-        egg = self._value_next = StateValue(_hatch())
+        egg = StateValue(_hatch())
+        egg.as_future().add_done_callback(self._update)
+
+        if hasattr(self, '_value_next'):
+            self._value, self._value_next = self._value_next, egg
+        else:
+            self._value = self._value_next = egg
 
         feathery_wormhole.set_result(egg)
-
         return egg
 
+    @abc.abstractmethod
+    def _on_set(self, _: _S): ...
+    @abc.abstractmethod
+    def _on_stop(self): ...
+    @abc.abstractmethod
+    def _on_error(self, exc: BaseException): ...
+    @abc.abstractmethod
+    def _on_cancel(self): ...
 
+
+class StateVar(StateVarBase[_S], _PredicatesMixin, Generic[_S]):
+    __slots__ = ()
+
+    def split(self: StateVar[Sequence[_RS, ...]]) -> StateVarTuple[_RS]:
+        # TODO docstring
+        n = len(self.get())
+
+        async def producer(i: int):
+            async for state in self:
+                yield state[i]
+
+        return StateVarTuple(*(producer(i) for i in range(n)))
+
+    def _on_set(self, _: _S):
+        self._set_predicate(set=True)
+
+    def _on_error(self, exc: BaseException):
+        self._set_predicate(done=True, error=True, cancel=False, stop=False)
+
+    def _on_cancel(self):
+        self._set_predicate(done=True, error=False, cancel=True, stop=False)
+
+    def _on_stop(self):
+        self._set_predicate(done=True, error=False, cancel=False, stop=True)
+
+
+class StateVarTuple(
+    Sequence[StateVar[_S]],
+    StateVarBase[tuple[_S, ...]],
+    Generic[_S],
+):
+    __slots__ = ('_statevars', )
+
+    _statevars: tuple[StateVarBase[_S], ...]
+
+    def __init__(
+        self,
+        *producers: StateVarBase[_S] | AsyncIterable[_S],
+    ) -> None:
+        if not producers:
+            raise TypeError('StateVarTuple() must have at least one argument.')
+
+        items = []
+        for i, producer in producers:
+            if isinstance(producer, StateVarBase):
+                items.append(producer)
+            else:
+                items.append(StateVar(producer))
+
+        self._statevars = tuple(items)
+
+        super().__init__(self._get_producer())
+
+    def __await__(self) -> Generator[Any, None, tuple[_S, ...]]:
+        return self._gather().__await__()
+
+    @overload
+    def __getitem__(self, i: int) -> StateVar[_S]: ...
+
+    @overload
+    def __getitem__(self, s: slice) -> StateVarTuple[_S]: ...
+
+    def __getitem__(self, i: int | slice) -> StateVar[_S] | StateVarTuple[_S]:
+        return self._statevars[i]
+
+    def __len__(self) -> int:
+        return len(self._statevars)
+
+    @property
+    def readonly(self) -> bool:
+        return True
+
+    def set(self, state: _S) -> NoReturn:
+        raise StateError(f'{type(self).__name__!r} cannot be set directly')
+
+    def starmap(
+        self,
+        function: Callable[..., _RS] | Callable[..., Awaitable[_RS]],
+    ) -> StateVar[_RS]:
+        return self.map(lambda args: function(*args))
+
+    async def _gather(self) -> tuple[_S, ...]:
+        return tuple(await asyncio.gather(*self._statevars))
+
+    async def _get_producer(self) -> AsyncIterator[tuple[_S]]:
+        states = await self._gather()
+        yield states
+
+        async for i, state in race(*self._statevars):
+            states = states[0:i] + (state, ) + states[i+1:]
+            yield states
+
+    def _on_set(self, _: _S):
+        # TODO all_set
+        self._set_predicate(set=True)
+
+    def _on_stop(self):
+        # TODO all_stopped
+        self._set_predicate(done=True, error=False, cancel=False, stop=True)
+
+    def _on_error(self, exc: BaseException):
+        self._set_predicate(done=True, error=True, cancel=False, stop=False)
+
+    def _on_cancel(self):
+        # TODO all_cancelled
+        self._set_predicate(done=True, error=False, cancel=True, stop=False)
