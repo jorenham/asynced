@@ -6,19 +6,23 @@ import abc
 import asyncio
 import collections
 import inspect
+import sys
 from typing import (
     Any, AsyncIterable,
     AsyncIterator,
-    Awaitable, Callable, Coroutine, Generator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Generator,
     Generic,
     Hashable,
     Literal,
     NoReturn,
     overload,
     Sequence,
-    TypeVar,
+    SupportsIndex, TypeVar,
 )
-from typing_extensions import Self, TypeAlias
+from typing_extensions import TypeAlias
 
 from ._states import SimpleStateBase, SimpleStateValue
 from ._typing import Maybe, Nothing
@@ -26,6 +30,7 @@ from .asyncio_utils import create_future, race
 from .exceptions import StateError, StopAnyIteration
 
 _T = TypeVar('_T')
+_KT = TypeVar('_KT', bound=SupportsIndex)
 
 _S = TypeVar('_S', bound=Hashable)
 _RS = TypeVar('_RS', bound=Hashable)
@@ -34,12 +39,27 @@ _RS = TypeVar('_RS', bound=Hashable)
 AwaitablePredicate: TypeAlias = SimpleStateValue[bool]
 
 
+def __intern_predicate_keys():
+    for key in ('done', 'stop', 'set', 'error', 'cancel'):
+        sys.intern(key)
+
+
+__intern_predicate_keys()
+
+
 class _PredicatesMixin:
+    __slots__ = ()
+
     _predicates: dict[str, AwaitablePredicate]
 
     @property
     def is_done(self) -> AwaitablePredicate:
         return self._predicates['done']
+
+    @property
+    def is_stopped(self) -> AwaitablePredicate:
+        """StopIteration or StopAsyncIteration was raised"""
+        return self._predicates['stop']
 
     @property
     def is_set(self) -> AwaitablePredicate:
@@ -52,11 +72,6 @@ class _PredicatesMixin:
     @property
     def is_cancelled(self) -> AwaitablePredicate:
         return self._predicates['cancel']
-
-    @property
-    def is_stopped(self) -> AwaitablePredicate:
-        """StopIteration or StopAsyncIteration was raised"""
-        return self._predicates['stop']
 
     def _set_predicate(self, **kwargs: bool) -> None:
         for key, value in kwargs.items():
@@ -153,22 +168,35 @@ class StateVarBase(
 
     def __aiter__(self: _S) -> AsyncIterator[_S]:
         async def _aiter():
+            prev = default = object()
             try:
-                yield await self
-
                 while True:
-                    yield await self._value_next
+                    current = self.get(default)
 
-            except (StopAsyncIteration, asyncio.CancelledError):
+                    if current is prev or current == prev:
+                        current = await self._value_next
+
+                        if current is prev or current == prev:
+                            continue
+
+                        yield current
+                        prev = current
+                        continue
+
+                    yield current
+                    prev = current
+                    await asyncio.sleep(0)
+
+            except (StopIteration, StopAsyncIteration, asyncio.CancelledError):
                 pass
 
         return _aiter()
 
     async def __anext__(self) -> _S:
         try:
-            return await self._value_next
-        except asyncio.CancelledError:
-            raise StopAsyncIteration
+            return await self.next()
+        except asyncio.CancelledError as exc:
+            raise StopAsyncIteration from exc
 
     def as_future(self) -> asyncio.Future[_S]:
         return self._value_next.as_future()
@@ -199,9 +227,19 @@ class StateVarBase(
         If currently there is no value, this state variable is returned,
         otherwise a new state variable
         """
-        if not self._value.as_future().done():
-            return self._value
-        return self._value_next
+        value = self._value
+        fut = value.as_future()
+        if fut.done():
+            fut.result()  # will raise if cancelled or raised
+        else:
+            return value
+
+        value_next = self._value_next
+        fut_next = value_next.as_future()
+        if fut_next.done():
+            res = fut_next.result()
+            raise StateError(f'the next value has been set (!?): {res!r}')
+        return value_next
 
     def set(self, state: _S) -> bool:
         """Set the new state. If the state is equal to the current state,
@@ -219,16 +257,15 @@ class StateVarBase(
         if self._value_next.is_done:
             raise StateError(f'{self!r} is done')
 
-        value, value_next = self._value, self._value_next
+        default = object()
+        if (current := self.get(default)) is not default:
+            if state is current or state == current:
+                return False
 
-        assert not value_next.is_set
-
-        if state == value:
-            return False
+        value_next = self._value_next
+        value_next.set(state)
 
         self.__schedule_next()
-
-        value_next.set(state)
         self._value = value_next
 
         self._update(value_next.as_future())
@@ -270,14 +307,29 @@ class StateVarBase(
 
         loop = asyncio.get_running_loop()
 
+        is_initial = not hasattr(self, '_value')
+
         async def _hatch():
             # Wait for the egg, but don't touch it! Unless you want spacetime
             # to fold into a singularity...
             interdimensional_egg: StateValue[_S] = await feathery_wormhole
 
+            chick_senpai = Nothing
+            if not is_initial:
+                try:
+                    chick_senpai = self.get()
+                except LookupError:
+                    pass
+
+            producer = self._producer
             try:
-                chick: _S = await self._producer.__anext__()
-            except (StopAsyncIteration, asyncio.CancelledError):
+                chick: _S = await producer.__anext__()
+
+                # strive for chick diversity; skip identical twins
+                if chick_senpai:
+                    while chick is chick_senpai or chick == chick_senpai:
+                        chick: _S = await producer.__anext__()
+            except (StopIteration, StopAsyncIteration, asyncio.CancelledError):
                 # The chicken mom went to the ctrl+Z clinic
                 raise
             except (KeyboardInterrupt, SystemExit):
@@ -304,10 +356,10 @@ class StateVarBase(
         egg = StateValue(_hatch())
         egg.as_future().add_done_callback(self._update)
 
-        if hasattr(self, '_value_next'):
-            self._value, self._value_next = self._value_next, egg
-        else:
+        if is_initial:
             self._value = self._value_next = egg
+        else:
+            self._value, self._value_next = self._value_next, egg
 
         feathery_wormhole.set_result(egg)
         return egg
@@ -365,7 +417,7 @@ class StateVarTuple(
             raise TypeError('StateVarTuple() must have at least one argument.')
 
         items = []
-        for i, producer in producers:
+        for i, producer in enumerate(producers):
             if isinstance(producer, StateVarBase):
                 items.append(producer)
             else:
@@ -387,6 +439,16 @@ class StateVarTuple(
     def __getitem__(self, i: int | slice) -> StateVar[_S] | StateVarTuple[_S]:
         return self._statevars[i]
 
+    def __setitem__(self, i: int, state: _S) -> None:
+        self._statevars[i].set(state)
+
+    def __contains__(self, item: object) -> bool:
+        if isinstance(item, StateVarBase):
+            return item in self._statevars
+
+        default = object()
+        return item in tuple(s for s in self.get(default) if s is not default)
+
     def __len__(self) -> int:
         return len(self._statevars)
 
@@ -394,7 +456,10 @@ class StateVarTuple(
     def readonly(self) -> bool:
         return True
 
-    def set(self, state: _S) -> NoReturn:
+    def get(self, default: Maybe[_T] = Nothing) -> tuple[_S | _T, ...]:
+        return tuple(sv.get(default) for sv in self._statevars)
+
+    def set(self, state: tuple[_S, ...]) -> NoReturn:
         raise StateError(f'{type(self).__name__!r} cannot be set directly')
 
     def starmap(

@@ -56,7 +56,7 @@ class SimpleStateBase(Awaitable[_S], FutureWrapperMixin[_S], Generic[_S]):
     def __del__(self):
         try:
             self.as_future().cancel()
-        except RuntimeError:
+        except (AttributeError, RuntimeError):
             pass
 
     def __await__(self) -> Generator[Any, None, _S]:

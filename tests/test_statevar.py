@@ -3,17 +3,30 @@ from typing import Final
 
 import pytest
 
-from asynced import StateError, StateVar
-from asynced.compat import anext
+from asynced import StateVar
+from asynced.compat import anext, aiter
 
 
 DT: Final[float] = .01
+
+
+@pytest.fixture(scope='module', autouse=True)
+def timeout_1s():
+    # You can do whatever you need here, just return/yield a number
+    return 1.0
 
 
 async def slowrange(dt, *args):
     for i in range(*args):
         await asyncio.sleep(dt)
         yield i
+
+
+async def state_enumerate(statevar: StateVar):
+    i = 0
+    async for v in statevar:
+        yield i, v
+        i += 1
 
 
 async def test_manual_initial():
@@ -56,6 +69,21 @@ async def test_manual_set():
     assert not bool(s.is_error)
     assert not bool(s.is_cancelled)
 
+    s.set('ham')
+    assert await s == 'ham'
+    assert s.get() == 'ham'
+
+
+async def test_manual_aiter():
+    s = StateVar()
+    ss = aiter(s)
+
+    s.set('spam')
+    assert await anext(ss) == 'spam'
+
+    s.set('ham')
+    assert await anext(ss) == 'ham'
+
 
 async def test_manual_next():
     s = StateVar()
@@ -76,6 +104,49 @@ async def test_manual_next():
     assert not bool(sn.is_cancelled)
 
     assert await sn == 'spam'
+
+
+async def test_manual_dedupe():
+    s = StateVar()
+    r = StateVar(state_enumerate(s))
+
+    assert s.set('spam')
+
+    ri, rv = await r
+    assert ri == 0
+    assert rv == 'spam'
+
+    rnext = r.next()
+    assert s.set('ham')
+    ri, rv = await rnext
+
+    assert ri == 1
+    assert rv == 'ham'
+
+    assert not s.set('ham')
+
+    o1 = object()
+    o2 = object()
+    assert o1 is o1
+    assert o1 is not o2
+    assert o1 != o2
+
+    rnext = r.next()
+    assert s.set(o1)
+    ri, rv = await rnext
+
+    assert ri == 2
+    assert rv is o1
+
+    rnext = r.next()
+
+    assert not s.set(o1)
+    assert s.set(o2)
+
+    ri, rv = await rnext
+
+    assert ri == 3
+    assert rv is o2
 
 
 async def test_iterable_initial():
@@ -189,3 +260,31 @@ async def test_iterable_empty():
     s = StateVar(slowrange(DT, 0))
     s_list = [x async for x in s]
     assert len(s_list) == 0
+
+
+async def test_iterable_dedupe():
+    o1 = object()
+    o2 = object()
+
+    async def produper():
+        yield 'spam'
+
+        await asyncio.sleep(DT)
+        yield 'ham'
+        await asyncio.sleep(DT)
+        yield 'ham'
+
+        await asyncio.sleep(DT)
+        yield o1
+        await asyncio.sleep(DT)
+        yield o1
+
+        await asyncio.sleep(DT)
+        yield o2
+
+    ss = [v async for v in StateVar(produper())]
+    assert ss[0] == 'spam'
+    assert ss[1] == 'ham'
+    assert ss[2] is o1
+    assert ss[3] is o2
+
