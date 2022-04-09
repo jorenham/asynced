@@ -39,6 +39,7 @@ executionEnvironments = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--maxfail=1"
 
 
 [build-system]

@@ -9,10 +9,10 @@ from asynced.compat import anext, aiter
 
 DT: Final[float] = .01
 
-
-@pytest.fixture(scope='function', autouse=True)
-def timeout_1s():
-    return 1.0
+#
+# @pytest.fixture(scope='function', autouse=True)
+# def timeout_1s():
+#     return 1.0
 
 
 async def slowrange(dt, *args):
@@ -41,17 +41,8 @@ async def test_manual_initial():
 
     o = object()
     assert s.get(o) is o
-
     with pytest.raises(LookupError):
         s.get()
-
-    ss = asyncio.shield(s)
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(ss, DT)
-    ss.cancel()
-
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(s.next(), DT)
 
 
 async def test_manual_set():
@@ -77,32 +68,13 @@ async def test_manual_aiter():
     s = StateVar()
     ss = aiter(s)
 
-    s.set('spam')
+    assert s.set('spam')
+    assert await s == 'spam'
     assert await anext(ss) == 'spam'
 
-    s.set('ham')
+    assert s.set('ham')
+    assert await s == 'ham'
     assert await anext(ss) == 'ham'
-
-
-async def test_manual_next():
-    s = StateVar()
-    sn = s.next()
-
-    assert not bool(sn.is_done)
-    assert not bool(sn.is_set)
-    assert not bool(sn.is_stopped)
-    assert not bool(sn.is_error)
-    assert not bool(sn.is_cancelled)
-
-    s.set('spam')
-
-    assert bool(sn.is_done)
-    assert bool(sn.is_set)
-    assert not bool(sn.is_stopped)
-    assert not bool(sn.is_error)
-    assert not bool(sn.is_cancelled)
-
-    assert await sn == 'spam'
 
 
 async def test_manual_dedupe():
@@ -115,7 +87,7 @@ async def test_manual_dedupe():
     assert ri == 0
     assert rv == 'spam'
 
-    rnext = r.next()
+    rnext = anext(r)
     assert s.set('ham')
     ri, rv = await rnext
 
@@ -130,14 +102,14 @@ async def test_manual_dedupe():
     assert o1 is not o2
     assert o1 != o2
 
-    rnext = r.next()
+    rnext = anext(r)
     assert s.set(o1)
     ri, rv = await rnext
 
     assert ri == 2
     assert rv is o1
 
-    rnext = r.next()
+    rnext = anext(r)
 
     assert not s.set(o1)
     assert s.set(o2)
@@ -184,9 +156,9 @@ async def test_iterable_set():
 async def test_iterable_next():
     s = StateVar(slowrange(DT, 42, 45))
 
-    assert await s.next() == 42
-    assert await s.next() == 43
-    assert await s.next() == 44
+    assert await anext(s) == 42
+    assert await anext(s) == 43
+    assert await anext(s) == 44
 
 
 async def test_iterable_exhaust():
@@ -233,7 +205,7 @@ async def test_iterable_cancelled():
 
     await asyncio.sleep(DT)
 
-    s.as_future().cancel()
+    s._consumer.cancel()
 
     default = object()
     assert await anext(s, default) is default
@@ -286,4 +258,3 @@ async def test_iterable_dedupe():
     assert ss[1] == 'ham'
     assert ss[2] is o1
     assert ss[3] is o2
-
