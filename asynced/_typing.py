@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 __all__ = (
+    'ItemCollection',
+
     'EllipsisType',
 
     'OneOrMany',
@@ -8,21 +10,6 @@ __all__ = (
 
     'Catchable', 'CatchableE',
     'Throwable', 'ThrowableE',
-
-    'AnyCoro',
-    'AsyncCallable',
-    'AsyncFunction',
-
-    'Awaitable1',
-    'Awaitable2',
-    'Awaitable3',
-    'AwaitableN',
-    'AwaitableX',
-
-    'Xsync',
-    'XsyncCallable',
-
-    'DefaultCoroutine',
 
     'Maybe',
     'Nothing',
@@ -32,32 +19,34 @@ __all__ = (
     'acallable',
 )
 
-import abc
 import asyncio
 import enum
 import inspect
-from types import TracebackType
 from typing import (
     Any,
     Awaitable,
     Callable,
-    cast,
     Coroutine,
     final,
     Final,
-    Generator,
-    Generic,
-    Literal,
-    NoReturn,
-    TypeVar,
+    Iterable, Iterator, Literal,
+    overload, Protocol, TypeVar,
     Union,
 )
 
-from typing_extensions import ParamSpec, TypeAlias, TypeGuard
+from typing_extensions import ParamSpec, Self, TypeAlias, TypeGuard
 
 _T = TypeVar('_T')
 _T_co = TypeVar('_T_co', covariant=True)
 _T_contra = TypeVar('_T_contra', contravariant=True)
+
+_VT = TypeVar('_VT')
+_VT_co = TypeVar('_VT_co', covariant=True)
+_VT_contra = TypeVar('_VT_contra', contravariant=True)
+
+_KT = TypeVar('_KT')
+_KT_co = TypeVar('_KT_co', covariant=True)
+_KT_contra = TypeVar('_KT_contra', contravariant=True)
 
 _OT = TypeVar('_OT', bound=object)
 _ET = TypeVar('_ET', bound=BaseException)
@@ -81,51 +70,21 @@ CatchableE: TypeAlias = Catchable[Exception]
 Throwable: TypeAlias = ObjOrType[_ET]
 ThrowableE: TypeAlias = Throwable[Exception]
 
-Awaitable1: TypeAlias = Awaitable[_T]
-Awaitable2: TypeAlias = Awaitable[Awaitable[_T]]
-Awaitable3: TypeAlias = Awaitable[Awaitable[Awaitable[_T]]]
-AwaitableN: TypeAlias = Union[Awaitable1[_T], Awaitable2[_T], Awaitable3[_T]]
-AwaitableX: TypeAlias = Union[_T, Awaitable1[_T], Awaitable2[_T], Awaitable3[_T]]
 
-Xsync: TypeAlias = Union[_T, AwaitableN[_T]]
+class ItemCollection(Protocol[_KT_contra, _T_co]):
+    __slots__ = ()
 
-AnyCoro: TypeAlias = Coroutine[Any, Any, _T]
-AsyncFunction: TypeAlias = Callable[_P, AnyCoro[_R]]
-AsyncCallable: TypeAlias = Callable[_P, Awaitable[_R]]
-XsyncCallable: TypeAlias = Callable[_P, Xsync[_T]]
+    def __len__(self) -> int: ...
 
+    @overload
+    def __getitem__(self, __k: _KT_contra) -> _T_co: ...
+    @overload
+    def __getitem__(self, __ks: slice) -> Self: ...
 
-# Abstract base classes
-
-class DefaultCoroutine(Coroutine[NoReturn, NoReturn, _T_co], Generic[_T_co]):
-    """Abstract base class that passes asyncio.iscoroutine."""
-
-    @abc.abstractmethod
-    def __await__(self) -> Generator[Any, None, _T_co]: ...
-
-    def send(self, __value: None) -> NoReturn:
-        raise StopIteration
-
-    # noinspection PyMethodMayBeStatic
-    def throw(
-        self,
-        __typ: type[BaseException] | BaseException,
-        __val: BaseException | object | None = None,
-        __tb: TracebackType | None = None
-    ) -> NoReturn:
-        if __val is None:
-            if __tb is None:
-                raise __typ
-            raise cast(type[BaseException], __typ)()
-        if __tb is not None:
-            raise __val.with_traceback(__tb)  # type: ignore
-        assert False
-
-    def close(self) -> NoReturn:
-        raise StopIteration
-
+    def __iter__(self) -> Iterator[_T_co]: ...
 
 # Sentinel for missing values, distinguishable from None
+
 
 @final
 class _NothingEnum(enum.Enum):

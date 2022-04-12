@@ -10,7 +10,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
-    ClassVar, Coroutine,
+    cast, ClassVar, Coroutine,
     Generator,
     Generic,
     Hashable,
@@ -129,7 +129,7 @@ class SimpleStateBase(Generic[_S]):
         self.future.cancel()
         self._on_cancel()
 
-    def _on_set(self, value: _S) -> None:
+    def _on_set(self, value: Maybe[Hashable] = Nothing) -> None:
         ...
 
     def _on_error(self, exc: BaseException) -> None:
@@ -171,15 +171,14 @@ class SimpleStateValue(SimpleStateBase[_S], Generic[_S]):
         *,
         name: str | None = None
     ) -> None:
+        loop = asyncio.get_running_loop()
+
         if coro is Nothing:
-            self._future = asyncio.get_running_loop().create_future()
+            self._future = loop.create_future()
         elif isinstance(coro, asyncio.Future):
             self._future = coro
-        elif inspect.isawaitable(coro):
-            if name is None:
-                name = f'StateValue-{self._task_counter()}'
-
-            self._future = asyncio.create_task(coro, name=name)
+        elif asyncio.iscoroutine(coro):
+            self._future = loop.create_task(coro, name=name)
         else:
             raise TypeError(f'a future or coroutine was expected, got {coro!r}')
 
@@ -195,7 +194,7 @@ class SimpleStateValue(SimpleStateBase[_S], Generic[_S]):
 
     def set(self, state: _S):
         self._set(state)
-    
+
     def _on_task_done(self, task: asyncio.Task[_S]):
         assert task.done()
 

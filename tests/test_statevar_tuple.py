@@ -10,9 +10,9 @@ from asynced.compat import aiter, anext
 
 DT: Final[float] = 0.01
 
-# @pytest.fixture(scope='function', autouse=True)
-# def timeout_1s():
-#     return 1.0
+@pytest.fixture(scope='function', autouse=True)
+def timeout_1s():
+    return 1.0
 
 
 async def test_initial():
