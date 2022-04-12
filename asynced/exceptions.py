@@ -11,7 +11,7 @@ import asyncio
 from typing import Final
 
 
-StopAnyIteration: Final = StopIteration, StopAsyncIteration, GeneratorExit
+StopAnyIteration: Final = StopIteration, StopAsyncIteration
 
 
 class StateError(asyncio.InvalidStateError):

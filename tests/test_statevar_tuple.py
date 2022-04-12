@@ -10,9 +10,9 @@ from asynced.compat import aiter, anext
 
 DT: Final[float] = 0.01
 
-@pytest.fixture(scope='function', autouse=True)
-def timeout_1s():
-    return 1.0
+# @pytest.fixture(scope='function', autouse=True)
+# def timeout_1s():
+#     return 1.0
 
 
 async def test_initial():
@@ -95,7 +95,7 @@ async def test_set_single():
     assert (await s) == ('spam',)
 
     assert bool(s.is_set)
-    assert bool(s.all_set)
+    assert bool(s.any_set)
 
 
 async def test_set_multi():
@@ -107,23 +107,23 @@ async def test_set_multi():
     assert s[0].get() == 'spam'
     assert s[0].is_set
 
-    assert bool(s.is_set)
-    assert not bool(s.all_set)
+    assert bool(s.any_set)
+    assert not bool(s.is_set)
     assert s.get(None) == ('spam', None, None)
     with pytest.raises(LookupError):
         s.get()
 
     s[1] = 'ham'
 
-    assert bool(s.is_set)
-    assert not bool(s.all_set)
+    assert bool(s.any_set)
+    assert not bool(s.is_set)
     assert s.get(None) == ('spam', 'ham', None)
     with pytest.raises(LookupError):
         s.get()
 
     s[2] = 'eggs'
+    assert bool(s.any_set)
     assert bool(s.is_set)
-    assert bool(s.all_set)
     assert s.get() == ('spam', 'ham', 'eggs')
     assert await s == ('spam', 'ham', 'eggs')
 
@@ -134,7 +134,7 @@ async def test_set_together():
     assert s[0] is s[1]
 
     s[0] = 'spam'
-    assert s.all_set
+    assert s.is_set
     assert s.get() == ('spam', ) * 2
 
 
@@ -150,12 +150,12 @@ async def test_producers_single_empty():
     ss = [v async for v, in s]
     assert not len(ss)
 
+    assert not s.any_set
     assert not s.is_set
-    assert not s.all_set
-    assert s.all_done
-    assert s.all_stopped
-    assert not s.all_error
-    assert not s.all_cancelled
+    assert s.is_done
+    assert s.is_stopped
+    assert not s.is_error
+    assert not s.is_cancelled
 
 
 async def test_producers_single_stop():
@@ -173,11 +173,11 @@ async def test_producers_single_stop():
     assert len(ss) == 3
     assert ss == ['spam', 'ham', 'eggs']
 
-    assert s.all_set
-    assert s.all_done
-    assert s.all_stopped
-    assert not s.all_error
-    assert not s.all_cancelled
+    assert s.is_set
+    assert s.is_done
+    assert s.is_stopped
+    assert not s.is_error
+    assert not s.is_cancelled
 
 
 async def test_producers_single_error():
@@ -190,12 +190,12 @@ async def test_producers_single_error():
     with pytest.raises(ZeroDivisionError):
         await s
 
+    assert s.any_error
     assert s.is_error
-    assert s.all_error
-    assert s.all_done
-    assert not s.all_set
-    assert not s.all_stopped
-    assert not s.all_cancelled
+    assert s.is_done
+    assert not s.is_set
+    assert not s.is_stopped
+    assert not s.is_cancelled
 
     with pytest.raises(ZeroDivisionError):
         await s
@@ -215,12 +215,18 @@ async def test_producers_single_set_and_error():
     with pytest.raises(ZeroDivisionError):
         assert await anext(ss) == -1/12
 
-    assert s.all_set
+    with pytest.raises(ZeroDivisionError):
+        await s
+
+    with pytest.raises(ZeroDivisionError):
+        await s[0]
+
+    assert s.any_set
+    assert s.any_error
     assert s.is_error
-    assert s.all_error
-    assert s.all_done
-    assert not s.all_stopped
-    assert not s.all_cancelled
+    assert s.is_done
+    assert not s.is_stopped
+    assert not s.is_cancelled
 
     with pytest.raises(ZeroDivisionError):
         await s
@@ -229,17 +235,23 @@ async def test_producers_single_set_and_error():
 async def test_producers_interleaved_stop():
     async def eggs():
         yield 'eggs'
-        await asyncio.sleep(DT)
+        await asyncio.sleep(DT * 2)
         yield 'EGGS'
-        await asyncio.sleep(DT)
+        await asyncio.sleep(DT * 2)
 
     async def bacon():
         await asyncio.sleep(DT)
         yield 'bacon'
-        await asyncio.sleep(DT)
+        await asyncio.sleep(DT * 2)
         yield 'BACON'
+        await asyncio.sleep(DT)
 
     s = StateVarTuple([eggs(), bacon()])
+    # si = aiter(s)
+    #
+    # assert await anext(si) == ('eggs', 'bacon')
+    # assert await anext(si) == ('EGGS', 'bacon')
+    # assert await anext(si) == ('EGGS', 'BACON')
 
     t0 = time.monotonic()
     ss = [v async for v in s]
@@ -250,55 +262,65 @@ async def test_producers_interleaved_stop():
     assert ss[1] == ('EGGS', 'bacon')
     assert ss[2] == ('EGGS', 'BACON')
 
-    assert t >= DT * 2
-    assert t < DT * 4
+    assert t >= DT * 4
+    assert t < DT * 8
 
-    assert s.all_set
-    assert s.all_done
-    assert s.all_stopped
-    assert not s.all_error
-    assert not s.all_cancelled
+    assert s.is_set
+    assert s.is_done
+    assert s.is_stopped
+    assert not s.is_error
+    assert not s.is_cancelled
 
 
 async def test_producers_interleaved_error():
     async def producer0():
         yield 1 / 1
-        await asyncio.sleep(DT)
+        await asyncio.sleep(DT*2)
         yield 0 / 1
-        await asyncio.sleep(DT)
+        await asyncio.sleep(DT*2)
         yield -1 / 1
+        await asyncio.sleep(DT)
 
     async def producer1():
         await asyncio.sleep(DT)
         yield 1 / 1
-        await asyncio.sleep(DT)
+        await asyncio.sleep(DT*2)
         yield 1 / 0
-        await asyncio.sleep(DT)
+        await asyncio.sleep(DT*2)
         yield 1 / -1
 
     s = StateVarTuple([producer0(), producer1()])
     ss = aiter(s)
 
     assert await anext(ss) == (1, 1)
-    assert s.all_set
+    assert s.is_set
     assert not s.is_error
 
     assert await anext(ss) == (0, 1)
 
     with pytest.raises(ZeroDivisionError):
         assert await anext(ss) == (0, -1/12)
-    with pytest.raises(ZeroDivisionError):
+    with pytest.raises(StopAsyncIteration):
         assert await anext(ss) == (-1, -1/12)
-    with pytest.raises(ZeroDivisionError):
+    with pytest.raises(StopAsyncIteration):
         assert await anext(ss) == (-1, -1)
 
-    assert s.all_done
+    await asyncio.sleep(DT * 4)
 
-    assert not s.is_error
-    assert not s.all_error
+    assert s.is_done
+    assert s[0].is_done
+    assert s[1].is_done
 
-    assert not s.is_cancelled
-    assert not s.all_cancelled
+    assert not s[0].is_error
+    assert s[1].is_error
 
-    assert s.is_stopped
-    assert not s.all_stopped
+    assert s.any_error
+    assert s.is_error
+
+    assert s[0].is_stopped
+    assert not s[1].is_stopped
+
+    assert not s.any_stopped
+    assert not s.is_stopped
+
+

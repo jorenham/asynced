@@ -47,7 +47,7 @@ def py_anext(
     https://github.com/python/cpython/blob/3.10/Lib/test/test_asyncgen.py
     """
     try:
-        __anext__: Callable[[AsyncIterator[_T]], Awaitable[_T]]
+        __anext__: Callable[[AsyncIterator[_T1]], Awaitable[_T1]]
         __anext__ = type(iterator).__anext__
     except AttributeError:
         raise TypeError(f'{iterator!r} is not an async iterator')

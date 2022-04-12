@@ -9,11 +9,11 @@ import inspect
 import itertools
 import sys
 from typing import (
-    AsyncIterable,
+    Any, AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
-    ClassVar,
+    cast, ClassVar,
     Collection,
     Final,
     Generic,
@@ -40,7 +40,7 @@ _K = TypeVar('_K')
 _S = TypeVar('_S', bound=Hashable)
 _S_co = TypeVar('_S_co', bound=Hashable, covariant=True)
 
-_SS = TypeVar('_SS', bound=Collection[Hashable])
+_SS = TypeVar('_SS', bound=Collection)
 
 _RS = TypeVar('_RS', bound=Hashable)
 
@@ -83,13 +83,14 @@ class StateVarBase(AsyncIterator[_S], SimpleStateBase[_S], Generic[_S]):
         self._waiters = {}
         self.__waiter_counter = itertools.count(0).__next__
 
-    def __aiter__(self: _S) -> AsyncIterator[_S]:
+    def __aiter__(self) -> AsyncIterator[_S]:
         async def _aiter():
             present = self._future
+            loop = present.get_loop()
 
             while not self._is_done:
                 waiter_id = self.__waiter_counter()
-                future = self._future.get_loop().create_future()
+                future: asyncio.Future[_S] = loop.create_future()
                 self._waiters[waiter_id] = future
 
                 if present is not None and present.done():
@@ -148,25 +149,14 @@ class StateVarBase(AsyncIterator[_S], SimpleStateBase[_S], Generic[_S]):
     def is_cancelled(self) -> AwaitablePredicate:
         return self._predicates['cancel']
 
-    def get(self, default: Maybe[_T] = Nothing) -> _S | _T:
-        """Return the current state value.
-
-        If not set, the method will return the default value of the `default`
-        argument of the method, if provided; or raise a LookupError.
-        """
-        fut = self.future
-        if fut.done():
-            try:
-                return fut.result()
-            except (StopAsyncIteration, asyncio.CancelledError):
-                if default is not Nothing:
-                    return default
-                raise
-
-        if default is not Nothing:
-            return default
-
-        raise LookupError(repr(self))
+    @overload
+    @abc.abstractmethod
+    def get(self, default: NothingType = ...) -> _S: ...
+    @overload
+    @abc.abstractmethod
+    def get(self, default: Any) -> _S | Any: ...
+    @abc.abstractmethod
+    def get(self, default: Maybe[Any] = Nothing) -> _S | Any: ...
 
     def set(self, state: _S) -> bool:
         """Set the new state. If the state is equal to the current state,
@@ -193,6 +183,14 @@ class StateVarBase(AsyncIterator[_S], SimpleStateBase[_S], Generic[_S]):
 
         return 'done' in self._predicates and bool(self._predicates['done'])
 
+    @overload
+    def _map(self, __f: Callable[[_S], Awaitable[_RS]]) -> AsyncIterator[_RS]:
+        ...
+
+    @overload
+    def _map(self, __f: Callable[[_S], _RS]) -> AsyncIterator[_RS]:
+        ...
+
     def _map(
         self,
         function: Callable[[_S], _RS] | Callable[[_S], Awaitable[_RS]],
@@ -207,7 +205,10 @@ class StateVarBase(AsyncIterator[_S], SimpleStateBase[_S], Generic[_S]):
                 if is_async is None:
                     is_async = inspect.isawaitable(res)
 
-                yield (await res) if is_async else res
+                if is_async:
+                    yield await cast(Awaitable[_RS], res)
+                else:
+                    yield cast(_RS, res)
 
         return producer()
 
@@ -249,7 +250,11 @@ class StateVarBase(AsyncIterator[_S], SimpleStateBase[_S], Generic[_S]):
     def _cancel(self) -> None:
         self._future.cancel()
 
-        self._on_cancel()
+        try:
+            self._on_cancel()
+        except RuntimeError:
+            # can occur when the event got closed
+            pass
 
         for waiter in self._waiters.values():
             if not waiter.done():
@@ -345,11 +350,9 @@ class StateCollectionBase(
 
         self._items_set = set()
         self._items_done = {}
-    
+
     @abc.abstractmethod
     def _get_collection(self) -> ItemCollection[_K, StateVarBase[_S]]: ...
-    @abc.abstractmethod
-    def _get_keys(self) -> Iterable[_K]: ...
 
     def __iter__(self) -> Iterator[StateVarBase[_S]]:
         return iter(self._get_collection())
@@ -359,14 +362,14 @@ class StateCollectionBase(
 
     def __getitem__(self, key: _K) -> StateVarBase[_S]:
         return self._get_collection()[key]
-        
+
     def __setitem__(self, key: _K, value: _S) -> None:
         self._get_collection()[key].set(value)
-        
+
     @property
     def readonly(self) -> bool:
         return any(s.readonly for s in self)
-    
+
     @property
     def any_set(self) -> AwaitablePredicate:
         return self._predicates_any['set']
@@ -398,8 +401,8 @@ class StateCollectionBase(
         items_set = self._items_set
         all_set = len(items_set | {item}) == len(self)
 
-        if all_set:
-            state = self.get(default=value)
+        if all_set and not self._is_raised:
+            state = cast(_SS, self.get(default=value))
             self._set(state)  # this calls _on_set()
 
         if item in items_set:
@@ -416,13 +419,17 @@ class StateCollectionBase(
             return
 
         if not items_done:
+            p_all = self._predicates
+            p_any = self._predicates_any
+
             self._predicates_any['done'].set(True)
 
             for key in ('stop', 'error', 'cancel'):
                 if status == key:
-                    self._predicates_any[key].set(True)
+                    p_any[key].set(True)
                 else:
-                    self._predicates[key].set(False)
+                    if key not in p_all or not p_all[key]._is_done:
+                        p_all[key].set(False)
 
         items_done[item] = status
 
@@ -430,6 +437,7 @@ class StateCollectionBase(
             self._on_done(status)
 
     def _on_item_stop(self, item: _K) -> None:
+        self._stop()
         self._on_item_done(item, 'stop')
 
     def _on_item_error(self, item: _K, exc: BaseException) -> None:
@@ -464,11 +472,11 @@ class StateVar(StateVarBase[_S], Generic[_S]):
     _name: Final[str]
     _i: int
 
-    _producer: Maybe[AsyncIterator[_S]]
-    _consumer: Final[Maybe[asyncio.Task[NoReturn]]]
+    _producer: Maybe[AsyncIterable[_S]]
+    _consumer: Final[Maybe[asyncio.Task[None | NoReturn]]]
 
     # Internal: for change notification to e.g. StateVarTuple
-    _parent_collections: list[tuple[_K, StateCollectionBase[_K, _S]]]
+    _collections: list[tuple[Any, StateCollectionBase[Any, _S, Any]]]
 
     def __init__(
         self,
@@ -502,7 +510,7 @@ class StateVar(StateVarBase[_S], Generic[_S]):
 
         self._i = 0 if start is None else start
 
-        self._parent_collections = []
+        self._collections = []
 
     @property
     def name(self) -> str:
@@ -515,8 +523,8 @@ class StateVar(StateVarBase[_S], Generic[_S]):
         """
         # TODO return an int-like statevar
         if hasattr(self, '_value'):
-            fut = self._value.future()
-            if fut.done() and not fut.cancelled():
+            future = self.future
+            if future.done() and not future.cancelled():
                 return self._i
 
         if default is not Nothing:
@@ -525,8 +533,35 @@ class StateVar(StateVarBase[_S], Generic[_S]):
         raise LookupError(repr(self))
 
     def next_at(self) -> int:
-        """Return the next iteration count, starting at 0."""
+        """Return the next iteration count, starting
+         at 0."""
         return self.at(self._i - 1) + 1
+
+    @overload
+    def get(self, default: NothingType = ...) -> _S: ...
+    @overload
+    def get(self, default: _T = ...) -> _S | _T: ...
+
+    def get(self, default: Maybe[_T] = Nothing) -> _S | _T:
+        """Return the current state value.
+
+        If not set, the method will return the default value of the
+        `default`
+        argument of the method, if provided; or raise a LookupError.
+        """
+        fut = self.future
+        if fut.done():
+            try:
+                return fut.result()
+            except (StopAsyncIteration, asyncio.CancelledError):
+                if default is not Nothing:
+                    return default
+                raise
+
+        if default is not Nothing:
+            return default
+
+        raise LookupError(repr(self))
 
     def map(
         self,
@@ -534,9 +569,10 @@ class StateVar(StateVarBase[_S], Generic[_S]):
     ) -> StateVar[_RS]:
         # TODO docstring
         name = f'{function.__name__}({self._name})'
-        return type(self)(self._map(function), name=name)
+        itr = cast(AsyncIterator[_RS], self._map(function))
+        return StateVar(itr, name=name)
 
-    def split(self: StateVar[Sequence[_RS, ...]]) -> StateVarTuple[_RS]:
+    def split(self: StateVar[Sequence[_RS]]) -> StateVarTuple[_RS]:
         # TODO docstring
         n = len(self.get())
 
@@ -553,10 +589,10 @@ class StateVar(StateVarBase[_S], Generic[_S]):
             return True
 
         return super()._is_done
-    
+
     def _get_task_name(self) -> str:
         return self._name
-    
+
     def _check(self) -> None | NoReturn:
         super()._check()
 
@@ -575,13 +611,22 @@ class StateVar(StateVarBase[_S], Generic[_S]):
 
         super()._check_next()
 
-    async def _consume(self):
+    async def _consume(self) -> None | NoReturn:
+        assert self._producer is not Nothing
         try:
             async for state in self._producer:
                 self._set(state)
         except (SystemExit, KeyboardInterrupt) as exc:
             self._raise(exc)
             raise
+        except GeneratorExit:
+            # don't attempt to "stop" if the loop was closed
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                self._cancel()
+            else:
+                self._stop()
         except StopAnyIteration:
             self._stop()
         except asyncio.CancelledError:
@@ -593,36 +638,36 @@ class StateVar(StateVarBase[_S], Generic[_S]):
 
     def _on_set(self, state: Maybe[_S] = Nothing) -> None:
         self._i += 1
-        
+
         super()._on_set(state)
 
-        for j, parent in self._parent_collections:
+        for j, parent in self._collections:
             # noinspection PyProtectedMember
             parent._on_item_set(j, state)
 
     def _on_stop(self) -> None:
         super()._on_stop()
 
-        for j, parent in self._parent_collections:
+        for j, parent in self._collections:
             # noinspection PyProtectedMember
             parent._on_item_stop(j)
 
     def _on_error(self, exc: BaseException) -> None:
         super()._on_error(exc)
 
-        for j, parent in self._parent_collections:
+        for j, parent in self._collections:
             # noinspection PyProtectedMember
             parent._on_item_error(j, exc)
 
     def _on_cancel(self) -> None:
         super()._on_cancel()
 
-        for j, parent in self._parent_collections:
+        for j, parent in self._collections:
             # noinspection PyProtectedMember
             parent._on_item_cancel(j)
 
 
-class StateVarTuple(StateCollectionBase[int, tuple[_S, ...], _S], Generic[_S]):
+class StateVarTuple(StateCollectionBase[int, _S, tuple[_S, ...]], Generic[_S]):
     __slots__ = ('_statevars', )
 
     _statevars: tuple[StateVar[_S], ...]
@@ -637,7 +682,7 @@ class StateVarTuple(StateCollectionBase[int, tuple[_S, ...], _S], Generic[_S]):
             statevars = [StateVar() for _ in range(producers)]
         else:
             statevars = []
-            for i, producer in enumerate(producers):
+            for producer in producers:
                 if isinstance(producer, StateVar):
                     statevar = producer
                 elif isinstance(producer, StateVarTuple):
@@ -654,12 +699,14 @@ class StateVarTuple(StateCollectionBase[int, tuple[_S, ...], _S], Generic[_S]):
                     statevar = StateVar(producer)
 
                 # noinspection PyProtectedMember
-                statevar._parent_collections.append((i, self))
-
                 statevars.append(statevar)
 
         if not statevars:
             raise TypeError('StateVarTuple() requires at least one statevar.')
+
+        for i, statevar in enumerate(statevars):
+            # noinspection PyProtectedMember
+            statevar._collections.append((i, self))
 
         self._statevars = tuple(statevars)
 
@@ -710,7 +757,7 @@ class StateVarTuple(StateCollectionBase[int, tuple[_S, ...], _S], Generic[_S]):
     def __getitem__(
         self,
         index: int | tuple[int] | slice
-    ) -> StateVarBase[_S]:
+    ) -> StateVarBase[_S] | StateVarTuple[_S]:
         if isinstance(index, int):
             return super().__getitem__(index)
         elif isinstance(index, tuple):
@@ -758,13 +805,14 @@ class StateVarTuple(StateCollectionBase[int, tuple[_S, ...], _S], Generic[_S]):
             Callable[[tuple[_S, ...]], Awaitable[_RS]]
         ],
     ) -> StateVar[_RS]:
-        return StateVar(self._map(function))
+        return StateVar(cast(AsyncIterator[_RS], self._map(function)))
 
     def starmap(
         self,
         function: Callable[..., _RS] | Callable[..., Awaitable[_RS]],
     ) -> StateVar[_RS]:
-        return self.map(lambda args: function(*args))
+        itr = cast(AsyncIterator[_RS], self._map(lambda args: function(*args)))
+        return StateVar(itr)
 
     # PyCharm doesn't understand walrus precedence:
     # noinspection PyRedundantParentheses
@@ -780,6 +828,3 @@ class StateVarTuple(StateCollectionBase[int, tuple[_S, ...], _S], Generic[_S]):
 
     def _get_collection(self) -> tuple[StateVar[_S], ...]:
         return self._statevars
-
-    def _get_keys(self) -> Iterable[int]:
-        return range(len(self._statevars))

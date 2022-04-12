@@ -20,8 +20,8 @@ from typing import (
     AsyncIterable,
     AsyncIterator,
     Callable,
-    Coroutine,
-    overload,
+    cast, Coroutine,
+    Literal, overload,
     TypeVar,
 )
 from typing_extensions import ParamSpec
@@ -47,6 +47,22 @@ async def resume(result: _T | None = None) -> _T | None:
     return await asyncio.sleep(0, result)
 
 
+@overload
+def race(
+    *args: AsyncIterable[_T],
+    yield_exceptions: Literal[True],
+) -> AsyncIterator[tuple[int, _T | BaseException]]:
+    ...
+
+
+@overload
+def race(
+    *args: AsyncIterable[_T],
+    yield_exceptions: Literal[False] = ...,
+) -> AsyncIterator[tuple[int, _T]]:
+    ...
+
+
 async def race(
     *args: AsyncIterable[_T],
     yield_exceptions: bool = False,
@@ -61,7 +77,9 @@ async def race(
 
     tasks: dict[str, tuple[int, asyncio.Task[_T]]] = {}
     for i, itr in enumerate(itrs):
-        task = asyncio.create_task(itr.__anext__())
+        task = asyncio.create_task(
+            cast(Coroutine[Any, None, _T], itr.__anext__())
+        )
         tasks[task.get_name()] = i, task
 
     while tasks:
@@ -100,7 +118,9 @@ async def race(
 
             # we create the next next task next:
             itr = itrs[i]
-            task = asyncio.create_task(itr.__anext__())
+            task = asyncio.create_task(
+                cast(Coroutine[Any, None, _T], itr.__anext__())
+            )
             name = task.get_name()
             tasks[name] = i, task
 
@@ -118,7 +138,7 @@ def create_future(
 
 
 def call_soon(
-    callback: Callable[_P, _R],
+    callback: Callable[_P, Any],
     *args: _P.args,
     **kwargs: _P.kwargs
 ) -> asyncio.Handle:
