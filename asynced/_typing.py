@@ -2,6 +2,7 @@ from __future__ import annotations
 
 __all__ = (
     'ItemCollection',
+    'Comparable',
 
     'EllipsisType',
 
@@ -69,6 +70,10 @@ CatchableE: TypeAlias = Catchable[Exception]
 
 Throwable: TypeAlias = ObjOrType[_ET]
 ThrowableE: TypeAlias = Throwable[Exception]
+
+
+class Comparable(Protocol):
+    def __eq__(self, other: Any) -> bool: ...
 
 
 class ItemCollection(Protocol[_KT_contra, _T_co]):

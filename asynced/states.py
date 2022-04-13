@@ -1,15 +1,13 @@
 from __future__ import annotations
 
-__all__ = ('StateVar', 'StateVarTuple')
+__all__ = ('StateVar', 'StateTuple', 'StateDict')
 
 import abc
 import asyncio
-import collections
-import inspect
 import itertools
-import sys
+from collections import UserDict
 from typing import (
-    Any, AsyncIterable,
+    AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
@@ -18,10 +16,8 @@ from typing import (
     Final,
     Generic,
     Hashable,
-    Iterable,
-    Iterator,
-    Literal,
-    NoReturn,
+    ItemsView, Iterable,
+    KeysView, Mapping, NoReturn,
     overload,
     Sequence,
     TypeVar,
@@ -29,10 +25,16 @@ from typing import (
 )
 from typing_extensions import TypeAlias
 
-from ._states import SimpleStateBase, SimpleStateValue
-from ._typing import ItemCollection, Maybe, Nothing, NothingType
+from ._states import State, StateCollection
+from ._typing import (
+    Comparable,
+    Maybe,
+    Nothing,
+    NothingType,
+)
 from .asyncio_utils import race
-from .exceptions import StateError, StopAnyIteration
+from .exceptions import StopAnyIteration
+
 
 _T = TypeVar('_T')
 _K = TypeVar('_K')
@@ -45,427 +47,11 @@ _SS = TypeVar('_SS', bound=Collection)
 _RS = TypeVar('_RS', bound=Hashable)
 
 
-AwaitablePredicate: TypeAlias = SimpleStateValue[bool]
-
 _Counter: TypeAlias = Callable[[], int]
-_DoneStatus: TypeAlias = Literal['stop', 'error', 'cancel']
 
 
-def __intern_predicate_keys():
-    for key in ('done', 'set', 'stop', 'error', 'cancel'):
-        sys.intern(key)
-
-
-__intern_predicate_keys()
-
-
-class StateVarBase(AsyncIterator[_S], SimpleStateBase[_S], Generic[_S]):
-    __slots__ = (
-        '_predicates',
-
-        '_future',
-        '_waiters',
-        '__waiter_counter',
-    )
-
-    _predicates: dict[str, AwaitablePredicate]
-
-    _future: asyncio.Future[_S]
-    _waiters: dict[int, asyncio.Future[_S]]
-    _predicates: dict[str, AwaitablePredicate]
-
-    def __init__(self) -> None:
-        super().__init__()
-
-        self._predicates = collections.defaultdict(SimpleStateValue)
-
-        self._future = asyncio.get_running_loop().create_future()
-        self._waiters = {}
-        self.__waiter_counter = itertools.count(0).__next__
-
-    def __aiter__(self) -> AsyncIterator[_S]:
-        async def _aiter():
-            present = self._future
-            loop = present.get_loop()
-
-            while not self._is_done:
-                waiter_id = self.__waiter_counter()
-                future: asyncio.Future[_S] = loop.create_future()
-                self._waiters[waiter_id] = future
-
-                if present is not None and present.done():
-                    try:
-                        yield present.result()
-                    except StopAsyncIteration:
-                        del self._waiters[waiter_id]
-                        break
-
-                present = None
-
-                try:
-                    yield await future
-                except StopAsyncIteration:
-                    break
-                finally:
-                    del self._waiters[waiter_id]
-
-        return _aiter()
-
-    async def __anext__(self) -> _S:
-        self._check_next()
-
-        waiter_id = self.__waiter_counter()
-        future = self._future.get_loop().create_future()
-        self._waiters[waiter_id] = future
-
-        try:
-            return await future
-        except asyncio.CancelledError as exc:
-            raise StopAsyncIteration from exc
-        finally:
-            del self._waiters[waiter_id]
-
-    @property
-    def future(self) -> asyncio.Future[_S]:
-        return self._future
-
-    @property
-    def is_set(self) -> AwaitablePredicate:
-        return self._predicates['set']
-
-    @property
-    def is_done(self) -> AwaitablePredicate:
-        return self._predicates['done']
-
-    @property
-    def is_stopped(self) -> AwaitablePredicate:
-        return self._predicates['stop']
-    
-    @property
-    def is_error(self) -> AwaitablePredicate:
-        return self._predicates['error']
-    
-    @property
-    def is_cancelled(self) -> AwaitablePredicate:
-        return self._predicates['cancel']
-
-    @overload
-    @abc.abstractmethod
-    def get(self, default: NothingType = ...) -> _S: ...
-    @overload
-    @abc.abstractmethod
-    def get(self, default: Any) -> _S | Any: ...
-    @abc.abstractmethod
-    def get(self, default: Maybe[Any] = Nothing) -> _S | Any: ...
-
-    def set(self, state: _S) -> bool:
-        """Set the new state. If the state is equal to the current state,
-        false is returned. Otherwise, the state is set, the waiters will
-        be notified, and true is returned.
-
-        Raises StateError if readonly.
-        """
-        self._check_next()
-
-        if not (skip := self._equals(state)):
-            self._set(state)
-
-        return not skip
-
-    @property
-    def _is_done(self) -> bool:
-        future = self._future
-        if not future.done():
-            return False
-
-        if future.cancelled() or future.exception() is not None:
-            return True
-
-        return 'done' in self._predicates and bool(self._predicates['done'])
-
-    @overload
-    def _map(self, __f: Callable[[_S], Awaitable[_RS]]) -> AsyncIterator[_RS]:
-        ...
-
-    @overload
-    def _map(self, __f: Callable[[_S], _RS]) -> AsyncIterator[_RS]:
-        ...
-
-    def _map(
-        self,
-        function: Callable[[_S], _RS] | Callable[[_S], Awaitable[_RS]],
-    ) -> AsyncIterator[_RS]:
-        async def producer() -> AsyncIterator[_RS]:
-            is_async = None
-            if asyncio.iscoroutinefunction(function):
-                is_async = True
-
-            async for state in self:
-                res = function(state)
-                if is_async is None:
-                    is_async = inspect.isawaitable(res)
-
-                if is_async:
-                    yield await cast(Awaitable[_RS], res)
-                else:
-                    yield cast(_RS, res)
-
-        return producer()
-
-    def _set(self, state: _S, always: bool = False,) -> None:
-        if not always and self._equals(state):
-            return
-
-        self.__get_fresh_future().set_result(state)
-        self._on_set(state)
-
-        for waiter in self._waiters.values():
-            if not waiter.done():
-                waiter.set_result(state)
-
-    def _stop(self) -> None:
-        future = self._future
-        if not future.done():
-            future.set_exception(StopAsyncIteration)
-
-        self._on_stop()
-
-        for waiter in self._waiters.values():
-            if not waiter.done():
-                waiter.set_exception(StopAsyncIteration)
-
-    def _raise(self, exc: BaseException) -> None:
-        if isinstance(exc, asyncio.CancelledError):
-            self._cancel()
-            return
-
-        self.__get_fresh_future().set_exception(exc)
-
-        self._on_error(exc)
-
-        for waiter in self._waiters.values():
-            if not waiter.done():
-                waiter.set_exception(exc)
-
-    def _cancel(self) -> None:
-        self._future.cancel()
-
-        try:
-            self._on_cancel()
-        except RuntimeError:
-            # can occur when the event got closed
-            pass
-
-        for waiter in self._waiters.values():
-            if not waiter.done():
-                waiter.cancel()
-
-    def _equals(self, state: _S) -> bool:
-        """Returns True if set and the argument is equal to the current state"""
-        future = self._future
-        if not future.done():
-            return False
-
-        # raises exception if thrown or cancelled
-        state_current = future.result()
-        if state is state_current:
-            return True
-
-        if state == state_current:
-            return True
-
-        return False
-
-    def _set_predicate(self, **kwargs: bool) -> None:
-        for key, value in kwargs.items():
-            predicate = self._predicates[key]
-            if not predicate._is_done:
-                predicate.set(value)
-
-    def _on_set(self, value: Maybe[_S] = Nothing) -> None:
-        self._set_predicate(set=value is not Nothing)
-
-    def _on_done(self, status: _DoneStatus):
-        self._set_predicate(
-            done=True,
-            set=False,
-            **{k: k == status for k in ('stop', 'error', 'cancel')}
-        )
-
-    def _on_stop(self) -> None:
-        self._on_done('stop')
-
-    def _on_error(self, exc: BaseException) -> None:
-        if isinstance(exc, StopAnyIteration):
-            self._on_stop()
-        elif isinstance(exc, asyncio.CancelledError):
-            self._on_cancel()
-        else:
-            self._on_done('error')
-
-    def _on_cancel(self) -> None:
-        self._on_done('cancel')
-
-    def _check(self) -> None | NoReturn:
-        future = self.future
-        if future.done():
-            # raises after set_exception() or cancel()
-            future.result()
-
-    def _check_next(self) -> None | NoReturn:
-        self._check()
-        if self._is_done:
-            raise StopAsyncIteration
-
-    def __get_fresh_future(self):
-        future = self._future
-        if future.done():
-            future = self._future = future.get_loop().create_future()
-        return future
-
-
-_SV_co = TypeVar('_SV_co', bound=StateVarBase, covariant=True)
-
-
-class StateCollectionBase(
-    StateVarBase[_SS],
-    Generic[_K, _S, _SS]
-):
-    __slots__ = (
-        '_predicates_any',
-
-        '_items_set',
-        '_items_done',
-    )
-
-    _items_set: set[_K]
-    _items_done: dict[_K, _DoneStatus]
-
-    _predicates_any: dict[str, AwaitablePredicate]
-
-    def __init__(self):
-        super().__init__()
-
-        self._predicates_any = collections.defaultdict(SimpleStateValue)
-
-        self._items_set = set()
-        self._items_done = {}
-
-    @abc.abstractmethod
-    def _get_collection(self) -> ItemCollection[_K, StateVarBase[_S]]: ...
-
-    def __iter__(self) -> Iterator[StateVarBase[_S]]:
-        return iter(self._get_collection())
-
-    def __len__(self) -> int:
-        return len(self._get_collection())
-
-    def __getitem__(self, key: _K) -> StateVarBase[_S]:
-        return self._get_collection()[key]
-
-    def __setitem__(self, key: _K, value: _S) -> None:
-        self._get_collection()[key].set(value)
-
-    @property
-    def readonly(self) -> bool:
-        return any(s.readonly for s in self)
-
-    @property
-    def any_set(self) -> AwaitablePredicate:
-        return self._predicates_any['set']
-
-    @property
-    def any_done(self) -> AwaitablePredicate:
-        return self._predicates_any['done']
-
-    @property
-    def any_stopped(self) -> AwaitablePredicate:
-        return self._predicates_any['stop']
-
-    @property
-    def any_error(self) -> AwaitablePredicate:
-        return self._predicates_any['error']
-
-    @property
-    def any_cancelled(self) -> AwaitablePredicate:
-        return self._predicates_any['cancel']
-
-    def set(self, state: tuple[_S, ...]) -> NoReturn:
-        raise StateError(f'{type(self).__name__!r} cannot be set directly')
-
-    def _get_futures(self) -> Iterable[asyncio.Future[_S]]:
-        for s in self:
-            yield s.future
-
-    def _on_item_set(self, item: _K, value: Maybe[_S] = Nothing) -> None:
-        items_set = self._items_set
-        all_set = len(items_set | {item}) == len(self)
-
-        if all_set and not self._is_raised:
-            state = cast(_SS, self.get(default=value))
-            self._set(state)  # this calls _on_set()
-
-        if item in items_set:
-            return
-
-        if not items_set:
-            self._predicates_any['set'].set(value is not Nothing)
-
-        items_set.add(item)
-
-    def _on_item_done(self, item: _K, status: _DoneStatus) -> None:
-        items_done = self._items_done
-        if item in items_done:
-            return
-
-        if not items_done:
-            p_all = self._predicates
-            p_any = self._predicates_any
-
-            self._predicates_any['done'].set(True)
-
-            for key in ('stop', 'error', 'cancel'):
-                if status == key:
-                    p_any[key].set(True)
-                else:
-                    if key not in p_all or not p_all[key]._is_done:
-                        p_all[key].set(False)
-
-        items_done[item] = status
-
-        if len(items_done) == len(self):
-            self._on_done(status)
-
-    def _on_item_stop(self, item: _K) -> None:
-        self._stop()
-        self._on_item_done(item, 'stop')
-
-    def _on_item_error(self, item: _K, exc: BaseException) -> None:
-        if isinstance(exc, (StopIteration, StopAsyncIteration, GeneratorExit)):
-            self._on_item_stop(item)
-            return
-        if isinstance(exc, asyncio.CancelledError):
-            self._on_item_cancel(item)
-            return
-
-        self._raise(exc)
-        self._on_item_done(item, 'error')
-
-    def _on_item_cancel(self, item: _K) -> None:
-        self._cancel()
-        self._on_item_done(item, 'cancel')
-
-
-class StateVar(StateVarBase[_S], Generic[_S]):
-    __slots__ = (
-        '_name',
-        '_i',
-
-        '_producer',
-        '_consumer',
-
-        '_parent_collections',
-    )
+class StateVar(State[_S], Generic[_S]):
+    __slots__ = ('_name', '_i', '_producer', '_consumer')
 
     _task_counter: ClassVar[_Counter] = itertools.count(0).__next__
 
@@ -475,17 +61,15 @@ class StateVar(StateVarBase[_S], Generic[_S]):
     _producer: Maybe[AsyncIterable[_S]]
     _consumer: Final[Maybe[asyncio.Task[None | NoReturn]]]
 
-    # Internal: for change notification to e.g. StateVarTuple
-    _collections: list[tuple[Any, StateCollectionBase[Any, _S, Any]]]
-
     def __init__(
         self,
         producer: Maybe[StateVar[_S] | AsyncIterable[_S]] = Nothing,
         *,
+        key: Callable[[_S], Comparable] = lambda s: s,
         name: str | None = None,
         start: int | None = None,
     ) -> None:
-        super().__init__()
+        super().__init__(key=key)
 
         if name is None:
             self._name = f'{type(self).__name__}_{self._task_counter()}'
@@ -509,8 +93,6 @@ class StateVar(StateVarBase[_S], Generic[_S]):
                 start = other_at - 1  # -1 because we have no value yet
 
         self._i = 0 if start is None else start
-
-        self._collections = []
 
     @property
     def name(self) -> str:
@@ -549,19 +131,7 @@ class StateVar(StateVarBase[_S], Generic[_S]):
         `default`
         argument of the method, if provided; or raise a LookupError.
         """
-        fut = self.future
-        if fut.done():
-            try:
-                return fut.result()
-            except (StopAsyncIteration, asyncio.CancelledError):
-                if default is not Nothing:
-                    return default
-                raise
-
-        if default is not Nothing:
-            return default
-
-        raise LookupError(repr(self))
+        return self._get(default)
 
     def map(
         self,
@@ -572,7 +142,7 @@ class StateVar(StateVarBase[_S], Generic[_S]):
         itr = cast(AsyncIterator[_RS], self._map(function))
         return StateVar(itr, name=name)
 
-    def split(self: StateVar[Sequence[_RS]]) -> StateVarTuple[_RS]:
+    def split(self: StateVar[Sequence[_RS]]) -> StateTuple[_RS]:
         # TODO docstring
         n = len(self.get())
 
@@ -580,7 +150,7 @@ class StateVar(StateVarBase[_S], Generic[_S]):
             async for state in self:
                 yield state[i]
 
-        return StateVarTuple(map(producer, range(n)))
+        return StateTuple(map(producer, range(n)))
 
     @property
     def _is_done(self) -> bool:
@@ -667,25 +237,27 @@ class StateVar(StateVarBase[_S], Generic[_S]):
             parent._on_item_cancel(j)
 
 
-class StateVarTuple(StateCollectionBase[int, _S, tuple[_S, ...]], Generic[_S]):
-    __slots__ = ('_statevars', )
+class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
+    __slots__ = ('_states', )
 
-    _statevars: tuple[StateVar[_S], ...]
+    _states: tuple[StateVar[_S], ...]
 
     def __init__(
         self,
         producers: int | Iterable[StateVar[_S] | AsyncIterable[_S]],
+        *,
+        key: Callable[[tuple[_S, ...]], Comparable] = lambda ss: ss,
     ) -> None:
-        super().__init__()
+        super().__init__(key=key)
 
         if isinstance(producers, int):
-            statevars = [StateVar() for _ in range(producers)]
+            states = [StateVar() for _ in range(producers)]
         else:
-            statevars = []
+            states = []
             for producer in producers:
                 if isinstance(producer, StateVar):
                     statevar = producer
-                elif isinstance(producer, StateVarTuple):
+                elif isinstance(producer, StateTuple):
                     raise TypeError(
                         f'{type(self).__name__!r} cannot contain itself'
                     )
@@ -699,71 +271,79 @@ class StateVarTuple(StateCollectionBase[int, _S, tuple[_S, ...]], Generic[_S]):
                     statevar = StateVar(producer)
 
                 # noinspection PyProtectedMember
-                statevars.append(statevar)
+                states.append(statevar)
 
-        if not statevars:
-            raise TypeError('StateVarTuple() requires at least one statevar.')
+        if not states:
+            raise TypeError(
+                f'{type(self).__name__}() requires at least one item.'
+            )
 
-        for i, statevar in enumerate(statevars):
+        for i, state in enumerate(states):
             # noinspection PyProtectedMember
-            statevar._collections.append((i, self))
+            state._collections.append((i, self))
 
-        self._statevars = tuple(statevars)
+        self._states = tuple(states)
 
     def __hash__(self) -> int:
-        return hash(self._statevars)
+        return hash(self._states)
 
     def __contains__(self, item: object) -> bool:
-        if isinstance(item, StateVarBase):
-            return item in self._statevars
+        if isinstance(item, State):
+            return item in self._states
 
         default = object()
-        return item in tuple(s for s in self.get(default) if s is not default)
+        return item in tuple(
+            s for s in self._get_values(default)
+            if s is not default
+        )
 
-    def __reversed__(self) -> StateVarTuple[_S]:
+    def __reversed__(self) -> StateTuple[_S]:
         return self[::-1]
 
-    def __add__(self, other: StateVarTuple[_S]):
+    def __add__(self, other: StateTuple[_S]):
         cls = type(self)
-        if not isinstance(other, StateVarTuple):
+        if not isinstance(other, StateTuple):
 
             raise TypeError(
                 f'can only concatenate {cls.__name__} (not '
                 f'{type(other).__name__!r}) to {cls.__name__}'
             )
 
-        return cls(self._statevars + other._statevars)
+        return cls(self._states + other._states)
 
-    def __mul__(self, value: int) -> StateVarTuple[_S]:
+    def __mul__(self, value: int) -> StateTuple[_S]:
         """Return self * value"""
         if not isinstance(value, int):
             raise TypeError(
                 f'can\'t multiply {type(self).__name__} by non-int of type '
                 f'{type(value).__name__}'
             )
-        return type(self)(self._statevars * value)
+        return type(self)(self._states * value, key=self._key)
 
-    def __rmul__(self, value: int) -> StateVarTuple[_S]:
+    def __rmul__(self, value: int) -> StateTuple[_S]:
         """Return value * self"""
         return self.__mul__(value)
 
     @overload
     def __getitem__(self, __k: int) -> StateVar[_S]: ...
     @overload
-    def __getitem__(self, __ks: tuple[int]) -> StateVarTuple[_S]: ...
+    def __getitem__(self, __ks: tuple[int]) -> StateTuple[_S]: ...
     @overload
-    def __getitem__(self, __ks: slice) -> StateVarTuple[_S]: ...
+    def __getitem__(self, __ks: slice) -> StateTuple[_S]: ...
 
     def __getitem__(
         self,
         index: int | tuple[int] | slice
-    ) -> StateVarBase[_S] | StateVarTuple[_S]:
+    ) -> State[_S] | StateTuple[_S]:
         if isinstance(index, int):
             return super().__getitem__(index)
         elif isinstance(index, tuple):
-            return type(self)(self[i] for i in index)
+            return type(self)((self[i] for i in index), key=self._key)
         elif isinstance(index, slice):
-            return type(self)(self[i] for i in range(*index.indices(len(self))))
+            return type(self)(
+                (self[i] for i in range(*index.indices(len(self)))),
+                key=self._key
+            )
         else:
             raise TypeError(
                 f'{type(self).__name__} indices must be integers or slices, '
@@ -777,26 +357,9 @@ class StateVarTuple(StateCollectionBase[int, _S, tuple[_S, ...]], Generic[_S]):
         """
         return True
 
-    @overload
-    def at(self, default: _T) -> tuple[int | _T, ...]: ...
-    @overload
-    def at(self, default: NothingType = ...) -> tuple[int, ...]: ...
-
-    def at(self, default: Maybe[_T] = Nothing) -> tuple[int | _T, ...]:
-        """Get current iteration counts of each statevar, starting at 0."""
-        return tuple(s.at(default) for s in self._statevars)
-
-    def next_at(self) -> tuple[int, ...]:
-        """Return the next iteration counts, starting at 0."""
-        return tuple(s.next_at() for s in self._statevars)
-
-    @overload
-    def get(self, default: NothingType = ...) -> tuple[_S, ...]: ...
-    @overload
-    def get(self, default: _T = ...) -> tuple[_S | _T, ...]: ...
-
-    def get(self, default: Maybe[_T] = Nothing) -> tuple[_S | _T, ...]:
-        return tuple(sv.get(default) for sv in self._statevars)
+    def get(self, key: int, default: Maybe[_T] = Nothing) -> _S | _T:
+        # noinspection PyProtectedMember
+        return self._states[key]._get(default)
 
     def map(
         self,
@@ -804,27 +367,87 @@ class StateVarTuple(StateCollectionBase[int, _S, tuple[_S, ...]], Generic[_S]):
             Callable[[tuple[_S, ...]], _RS],
             Callable[[tuple[_S, ...]], Awaitable[_RS]]
         ],
+        *,
+        key: Callable[[_RS], Comparable] = lambda r: r
     ) -> StateVar[_RS]:
-        return StateVar(cast(AsyncIterator[_RS], self._map(function)))
+        return StateVar(cast(AsyncIterator[_RS], self._map(function)), key=key)
 
     def starmap(
         self,
         function: Callable[..., _RS] | Callable[..., Awaitable[_RS]],
+        *,
+        key: Callable[[_RS], Comparable] = lambda r: r
     ) -> StateVar[_RS]:
         itr = cast(AsyncIterator[_RS], self._map(lambda args: function(*args)))
-        return StateVar(itr)
+        return StateVar(itr, key=key)
 
     # PyCharm doesn't understand walrus precedence:
     # noinspection PyRedundantParentheses
     async def _get_producer(self) -> AsyncIterator[tuple[_S]]:
         try:
-            yield (states := tuple(await asyncio.gather(*self._statevars)))
+            yield (states := tuple(await asyncio.gather(*self._states)))
 
-            async for i, state in race(*self._statevars):
+            async for i, state in race(*self._states):
                 yield (states := states[:i] + (state, ) + states[i+1:])
 
         except StopAsyncIteration:
             pass
 
-    def _get_collection(self) -> tuple[StateVar[_S], ...]:
-        return self._statevars
+    def _get_states(self) -> tuple[StateVar[_S], ...]:
+        return self._states
+
+    def _get_values(self, default: Maybe[_S] = Nothing) -> tuple[_S, ...]:
+        return tuple(sv.get(default) for sv in self._states)
+
+
+class StateDict(
+    UserDict[_K, State[_S]],
+    StateCollection[_K, _S, dict[_K, _S]],
+    Generic[_K, _S],
+):
+    __slots__ = ('_states',)
+
+    _states: dict[_K, State[_S]]
+
+    def __init__(
+        self,
+        mapping: Mapping[_K, State[_S]] | AsyncIterable[tuple[_K, _S]],
+        /,
+        **states: State[_S],
+    ) -> None:
+        super().__init__()
+
+        states = {}
+        for key, state in states.items():
+            if not isinstance(state, State):
+                raise TypeError(
+                    f'expected a StateVar or async iterables, got '
+                    f'{type(state).__name__!r} instead'
+                )
+
+            states[key] = state
+
+        self._states = states
+
+    @overload
+    @abc.abstractmethod
+    def get(self, key: _K, default: NothingType = ...) -> _S: ...
+    @overload
+    @abc.abstractmethod
+    def get(self, key: _K, default: _T = ...) -> _S | _T: ...
+
+    def get(self, key: _K, default: Maybe[_T] = Nothing) -> _S | _T:
+        return self._states[key]._get(default)
+
+    def items(self) -> ItemsView[_K, _S]:
+        # TODO
+        ...
+
+    def keys(self) -> KeysView[_K]:
+        return self._states.keys()
+
+    def _get_states(self) -> dict[_K, State[_S]]:
+        return self._states
+
+    def _get_values(self, default: Maybe[_T] = Nothing) -> dict[_K, _S | _T]:
+        return {k: s._get(default) for k, s in self._states.items()}

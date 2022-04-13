@@ -4,7 +4,7 @@ from typing import Final
 
 import pytest
 
-from asynced import StateVar, StateVarTuple
+from asynced import StateVar, StateTuple
 from asynced.compat import aiter, anext
 
 
@@ -17,7 +17,7 @@ DT: Final[float] = 0.01
 
 async def test_initial():
     s0, s1 = StateVar(), StateVar()
-    s = StateVarTuple((s0, s1))
+    s = StateTuple((s0, s1))
 
     assert not bool(s.is_set)
     assert not bool(s.is_done)
@@ -26,14 +26,18 @@ async def test_initial():
     assert not bool(s.is_cancelled)
 
     o = 'O'
-    assert s.get(o) == (o, o)
+    assert s.get(0, o) == s.get(1, o) == o
 
     with pytest.raises(LookupError):
-        s.get()
+        s.get(0)
+    with pytest.raises(LookupError):
+        s.get(1)
+    with pytest.raises(IndexError):
+        s.get(2)
 
 
 async def test_indexing():
-    s = StateVarTuple(3)
+    s = StateTuple(3)
 
     assert len(s) == 3
 
@@ -48,7 +52,7 @@ async def test_indexing():
 
 
 async def test_unpacking():
-    s = StateVarTuple(2)
+    s = StateTuple(2)
 
     s0, s1 = s
 
@@ -60,10 +64,10 @@ async def test_unpacking():
 
 
 async def test_slicing():
-    s = StateVarTuple(3)
+    s = StateTuple(3)
 
     s_copy = s[:]
-    assert isinstance(s_copy, StateVarTuple)
+    assert isinstance(s_copy, StateTuple)
     assert s_copy is not s
     assert all(a is b for a, b in zip(s, s_copy))
 
@@ -73,10 +77,10 @@ async def test_slicing():
 
 
 async def test_reversed():
-    s = StateVarTuple(3)
+    s = StateTuple(3)
 
     r = reversed(s)
-    assert isinstance(r, StateVarTuple)
+    assert isinstance(r, StateTuple)
 
     assert r[0] is s[2]
     assert r[1] is s[1]
@@ -84,14 +88,14 @@ async def test_reversed():
 
 
 async def test_set_single():
-    s = StateVarTuple(1)
+    s = StateTuple(1)
 
     s[0] = 'spam'
 
     assert (await s[0]) == 'spam'
     assert s[0].get() == 'spam'
 
-    assert s.get() == ('spam', )
+    assert s.get(0) == 'spam'
     assert (await s) == ('spam',)
 
     assert bool(s.is_set)
@@ -99,7 +103,7 @@ async def test_set_single():
 
 
 async def test_set_multi():
-    s = StateVarTuple(3)
+    s = StateTuple(3)
 
     s[0] = 'spam'
 
@@ -109,33 +113,44 @@ async def test_set_multi():
 
     assert bool(s.any_set)
     assert not bool(s.is_set)
-    assert s.get(None) == ('spam', None, None)
+
+    assert s.get(0) == 'spam'
+
+    assert s.get(1, None) is None
+    assert s.get(2, None) is None
+
     with pytest.raises(LookupError):
-        s.get()
+        s.get(1)
+    with pytest.raises(LookupError):
+        s.get(2)
 
     s[1] = 'ham'
 
     assert bool(s.any_set)
     assert not bool(s.is_set)
-    assert s.get(None) == ('spam', 'ham', None)
+    assert s.get(1) == 'ham'
+
     with pytest.raises(LookupError):
-        s.get()
+        s.get(2)
 
     s[2] = 'eggs'
+
     assert bool(s.any_set)
     assert bool(s.is_set)
-    assert s.get() == ('spam', 'ham', 'eggs')
+
+    assert s.get(2) == 'eggs'
     assert await s == ('spam', 'ham', 'eggs')
 
 
 async def test_set_together():
-    s = StateVarTuple(1) * 2
+    s = StateTuple(1) * 2
     assert len(s) == 2
     assert s[0] is s[1]
 
     s[0] = 'spam'
     assert s.is_set
-    assert s.get() == ('spam', ) * 2
+    assert s.get(0) == 'spam'
+    assert s.get(1) == 'spam'
 
 
 async def test_producers_single_empty():
@@ -146,7 +161,7 @@ async def test_producers_single_empty():
         def __anext__(self):
             raise StopAsyncIteration
 
-    s = StateVarTuple([EmptyAiter()])
+    s = StateTuple([EmptyAiter()])
     ss = [v async for v, in s]
     assert not len(ss)
 
@@ -167,7 +182,7 @@ async def test_producers_single_stop():
         yield 'eggs'
         await asyncio.sleep(DT)
 
-    s = StateVarTuple([producer()])
+    s = StateTuple([producer()])
     ss = [v async for v, in s]
 
     assert len(ss) == 3
@@ -185,7 +200,7 @@ async def test_producers_single_error():
         await asyncio.sleep(DT)
         yield 1 / 0
 
-    s = StateVarTuple([producer()])
+    s = StateTuple([producer()])
 
     with pytest.raises(ZeroDivisionError):
         await s
@@ -208,8 +223,9 @@ async def test_producers_single_set_and_error():
         await asyncio.sleep(DT)
         yield 1 / 0
 
-    s = StateVarTuple([producer()])
+    s = StateTuple([producer()])
     ss = aiter(s)
+    dict()
 
     assert await anext(ss) == (1, )
     with pytest.raises(ZeroDivisionError):
@@ -246,7 +262,7 @@ async def test_producers_interleaved_stop():
         yield 'BACON'
         await asyncio.sleep(DT)
 
-    s = StateVarTuple([eggs(), bacon()])
+    s = StateTuple([eggs(), bacon()])
     # si = aiter(s)
     #
     # assert await anext(si) == ('eggs', 'bacon')
@@ -289,7 +305,7 @@ async def test_producers_interleaved_error():
         await asyncio.sleep(DT*2)
         yield 1 / -1
 
-    s = StateVarTuple([producer0(), producer1()])
+    s = StateTuple([producer0(), producer1()])
     ss = aiter(s)
 
     assert await anext(ss) == (1, 1)
@@ -322,5 +338,3 @@ async def test_producers_interleaved_error():
 
     assert not s.any_stopped
     assert not s.is_stopped
-
-
