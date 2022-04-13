@@ -280,6 +280,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         self._waiters = {}
         self.__waiter_counter = itertools.count(0).__next__
 
+        # TODO use weakref
         self._collections = []
 
     def __aiter__(self) -> AsyncIterator[_S]:
@@ -552,12 +553,12 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
 
     @overload
     @abc.abstractmethod
-    def _get_values(self, default: NothingType = ...) -> _SS: ...
+    def _get_data(self, default: NothingType = ...) -> _SS: ...
     @overload
     @abc.abstractmethod
-    def _get_values(self, default: _S = ...) -> _SS: ...
+    def _get_data(self, default: _S = ...) -> _SS: ...
     @abc.abstractmethod
-    def _get_values(self, default: Maybe[_S] = Nothing) -> _SS: ...
+    def _get_data(self, default: Maybe[_S] = Nothing) -> _SS: ...
 
     def __iter__(self) -> Iterator[State[_S]]:
         return iter(self._get_states())
@@ -614,7 +615,7 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
         all_set = len(items_set | {item}) == len(self)
 
         if all_set and not self._is_raised:
-            state = cast(_SS, self._get_values(default=value))
+            state = cast(_SS, self._get_data(default=value))
             self._set(state)  # this calls _on_set()
 
         if item in items_set:
@@ -632,6 +633,10 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
             if not self._items_set:
                 self._predicates_any['set'].clear()
                 self._predicates['set'].clear()
+
+        elif len(self._items_set) > 1 and len(self._items_set) == len(self):
+            state = cast(_SS, self._get_data())
+            self._set(state)
 
         if item in self._items_done:
             status = self._items_done.pop(item)
