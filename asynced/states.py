@@ -411,7 +411,7 @@ class StateInt(StateNumber[int]):
 
     def __init__(
         self,
-        producer: Maybe[int | StateVar[int] | AsyncIterable[int]],
+        producer: Maybe[int | StateVar[int] | AsyncIterable[int]] = None,
         *,
         name: str | None = None,
         start: int | None = None,
@@ -665,7 +665,7 @@ class StateDict(
     StateCollection[_K, _S, dict[_K, _S]],
     Generic[_K, _S],
 ):
-    __slots__ = ('_states',)
+    __slots__ = ('_states', '_count')
 
     _states: dict[_K, State[_S]]
     _count: Final[StateInt]
@@ -697,7 +697,6 @@ class StateDict(
             self._states[key] = state
 
         self._count = StateInt(self._get_counter(), name=f'len({self!r})')
-        self._update_count()
 
     def __len__(self) -> StateInt:
         return self._count
@@ -774,7 +773,6 @@ class StateDict(
             state._collections.remove((key, self))
 
         self._states.clear()
-        self._update_count()
 
     def _get_states(self) -> dict[_K, State[_S]]:
         return {
@@ -789,13 +787,9 @@ class StateDict(
         # noinspection PyProtectedMember
         return {k: s._get(default) for k, s in self._states}
 
-    def _update_count(self):
-        self._count.set(len(self._get_data()))
+    def _get_counter(self):
+        async def _producer():
+            async for _ in self:
+                yield len(self._get_states())
 
-    def _on_item_set(self, item: _K, value: Maybe[_S] = Nothing) -> None:
-        super()._on_item_set(item, value)
-        self._update_count()
-
-    def _on_item_del(self, item: _K) -> None:
-        super()._on_item_del(item)
-        self._update_count()
+        return StateInt(_producer())
