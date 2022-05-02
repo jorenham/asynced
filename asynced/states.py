@@ -1,31 +1,42 @@
 from __future__ import annotations
 
-__all__ = ('StateVar', 'StateTuple', 'StateDict')
+__all__ = (
+    'StateVar',
+    'StateTuple',
+    'StateDict',
+    'statefunction',
+)
 
-import abc
+
 import asyncio
+import functools
 import itertools
-import operator
+
 from typing import (
-    Any, AsyncIterable,
+    Any,
+    AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
-    cast, ClassVar,
-    Collection,
+    ClassVar,
     Final,
-    Generator, Generic,
+    Generic,
+    get_origin,
+    get_type_hints,
     Hashable,
-    ItemsView, Iterable,
-    KeysView, Mapping,
-    NoReturn,
+    ItemsView,
+    Iterable,
+    KeysView,
+    Mapping,
     overload,
     Sequence,
     TypeVar,
-    Union, ValuesView,
+    Union,
+    ValuesView,
 )
-from typing_extensions import Self, TypeAlias
+from typing_extensions import TypeAlias
 
+from . import StateError
 from ._states import State, StateCollection
 from ._typing import (
     Comparable,
@@ -34,43 +45,33 @@ from ._typing import (
     NothingType,
 )
 from .asyncio_utils import race
-from .exceptions import StateError, StopAnyIteration
 
 
-_T = TypeVar('_T')
+_T = TypeVar('_T', bound=object)
 _K = TypeVar('_K')
 
 _S = TypeVar('_S', bound=Hashable)
 _S_co = TypeVar('_S_co', bound=Hashable, covariant=True)
 _N = TypeVar('_N', bool, int)
-_SN = TypeVar('_SN', bound='StateNumber')
-
-_SS = TypeVar('_SS', bound=Collection)
 
 _RS = TypeVar('_RS', bound=Hashable)
-
 
 _Counter: TypeAlias = Callable[[], int]
 
 
 class StateVar(State[_S], Generic[_S]):
-    __slots__ = ('_name', '_i', '_producer', '_consumer')
+    __slots__ = ('_name',)
 
     _task_counter: ClassVar[_Counter] = itertools.count(0).__next__
 
     _name: Final[str]
-    _i: int
-
-    _producer: Maybe[AsyncIterable[_S]]
-    _consumer: Maybe[asyncio.Task[None | NoReturn]]
 
     def __init__(
         self,
-        producer: Maybe[StateVar[_S] | AsyncIterable[_S]] = Nothing,
+        producer: Maybe[AsyncIterable[_S]] = Nothing,
         *,
         key: Callable[[_S], Comparable] = lambda s: s,
         name: str | None = None,
-        start: int | None = None,
     ) -> None:
         super().__init__(key=key)
 
@@ -82,38 +83,15 @@ class StateVar(State[_S], Generic[_S]):
         self._producer = Nothing
         self._consumer = Nothing
 
-        if producer is not None:
+        if producer is not Nothing:
             self.set_from(producer)
-            if start is None and isinstance(producer, type(self)):
-                if other_at := producer.at(None):
-                    start = other_at - 1  # -1 because we have no value yet
 
-        self._i = 0 if start is None else start
+    def __bool__(self) -> bool:
+        return self.is_set
 
     @property
     def name(self) -> str:
         return self._name
-
-    def at(self, default: Maybe[_T] = Nothing) -> int | _T:
-        """Get current iteration count, starting at 0.
-
-        If not set, raises LookupError.
-        """
-        # TODO return an int-like statevar
-        if hasattr(self, '_value'):
-            future = self.future
-            if future.done() and not future.cancelled():
-                return self._i
-
-        if default is not Nothing:
-            return default
-
-        raise LookupError(repr(self))
-
-    def next_at(self) -> int:
-        """Return the next iteration count, starting
-         at 0."""
-        return self.at(self._i - 1) + 1
 
     @overload
     def get(self, default: NothingType = ...) -> _S: ...
@@ -129,26 +107,23 @@ class StateVar(State[_S], Generic[_S]):
         """
         return self._get(default)
 
-    def set_from(self, producer: StateVar[_S] | AsyncIterable[_S]):
-        if self._producer is not Nothing:
-            raise StateError(f'{self!r} is already being set')
+    def set(self, state: _S) -> bool:
+        """Set the new state. If the state is equal to the current state,
+        false is returned. Otherwise, the state is set, the waiters will
+        be notified, and true is returned.
 
+        Raises StateError if readonly.
+        """
+        self._check_next()
+
+        if not (skip := self._equals(state)):
+            self._set(state)
+
+        return not skip
+
+    def set_from(self, state_producer: AsyncIterable[_S]):
         self._check()
-
-        self._producer = producer
-        self._consumer = asyncio.create_task(
-            self._consume(),
-            name=f'{self._name}.consumer'
-        )
-
-    def map(
-        self,
-        function: Callable[[_S], _RS] | Callable[[_S], Awaitable[_RS]],
-    ) -> StateVar[_RS]:
-        # TODO docstring
-        name = f'{function.__name__}({self._name})'
-        itr = cast(AsyncIterator[_RS], self._map(function))
-        return type(self)(itr, name=name)
+        self._set_from(state_producer)
 
     def split(self: StateVar[Sequence[_RS]]) -> StateTuple[_RS]:
         # TODO docstring
@@ -160,63 +135,10 @@ class StateVar(State[_S], Generic[_S]):
 
         return StateTuple(map(producer, range(n)))
 
-    @property
-    def _is_done(self) -> bool:
-        consumer = self._consumer
-        if consumer is not Nothing and consumer.done():
-            return True
-
-        return super()._is_done
-
     def _get_task_name(self) -> str:
         return self._name
 
-    def _check(self) -> None | NoReturn:
-        super()._check()
-
-        consumer = self._consumer
-        if consumer is not Nothing and consumer.done():
-            if consumer.exception() is not None:
-                consumer.result()  # raises exception
-            elif consumer.cancelled() and not self._is_set:
-                consumer.result()  # raises asyncio.CancelledError
-
-    def _check_next(self) -> None | NoReturn:
-        consumer = self._consumer
-        if consumer is not Nothing and consumer.done():
-            consumer.result()
-            raise StopAsyncIteration
-
-        super()._check_next()
-
-    async def _consume(self) -> None | NoReturn:
-        assert self._producer is not Nothing
-        try:
-            async for state in self._producer:
-                self._set(state)
-        except (SystemExit, KeyboardInterrupt) as exc:
-            self._raise(exc)
-            raise
-        except GeneratorExit:
-            # don't attempt to "stop" if the loop was closed
-            try:
-                asyncio.get_running_loop()
-            except RuntimeError:
-                self._cancel()
-            else:
-                self._stop()
-        except StopAnyIteration:
-            self._stop()
-        except asyncio.CancelledError:
-            self._cancel()
-        except BaseException as exc:
-            self._raise(exc)
-        else:
-            self._stop()
-
     def _on_set(self, state: Maybe[_S] = Nothing) -> None:
-        self._i += 1
-
         super()._on_set(state)
 
         for j, parent in self._collections:
@@ -245,270 +167,26 @@ class StateVar(State[_S], Generic[_S]):
             parent._on_item_cancel(j)
 
 
-class StateNumber(StateVar[_N]):
-    __slots__ = ()
-
-    def __init__(
-        self,
-        producer: Maybe[_N | StateVar[_N] | AsyncIterable[_N]] = Nothing,
-        *,
-        name: str | None = None,
-        start: int | None = None,
-        default: Maybe[_N] = Nothing
-    ) -> None:
-        if isinstance(producer, int):
-            value = self._coerce(producer)
-            producer = Nothing
-        else:
-            value = None
-
-        super().__init__(producer, name=name, start=start)
-
-        if value is not None:
-            self.set(value)
-
-        self._default = default
-
-    def __await__(self) -> Generator[Any, None, _N]:
-        return self._wait().__await__()
-
-    def __bool__(self) -> bool:
-        return bool(self._get(False))
-
-    def __int__(self) -> int:
-        return int(self._get(0))
-
-    def __float__(self) -> float:
-        return float(self.__int__())
-
-    def __pos__(self) -> StateInt:
-        return cast(StateInt, self.map(lambda i: +i))
-
-    def __neg__(self) -> StateInt:
-        return cast(StateInt, self.map(lambda i: -i))
-
-    def __abs__(self) -> StateInt:
-        return cast(StateInt, self.map(lambda i: abs(i)))
-
-    def __eq__(self, other: Any) -> StateBool:
-        return self._map_with(operator.eq, other, '{} == {}', cls=StateBool)
-
-    def __ne__(self, other: Any) -> StateBool:
-        return self._map_with(operator.ne, other, '{} != {}', cls=StateBool)
-
-    def __add__(self, other: int | StateNumber[int]) -> StateInt:
-        return self._map_with(operator.add, other, '{} + {}')
-
-    __radd__ = __add__
-
-    def __iadd__(self, other: int) -> Self:
-        return self._apply_with(operator.add, other)
-
-    def __mul__(self, other: int | StateNumber[int]) -> StateInt:
-        return self._map_with(operator.mul, other, '{} * {}')
-
-    __rmul__ = __mul__
-
-    def __imul__(self, other: int) -> Self:
-        return self._apply_with(operator.mul, other)
-
-    def __mod__(self, other: int | StateNumber[int]) -> StateInt:
-        return self._map_with(operator.mod, other, '{} % {}')
-
-    def __rmod__(self, other: int | StateNumber[int]) -> StateInt:
-        return self._map_with(operator.mod, other, '{} % {}', reverse=True)
-
-    def __imod__(self, other: int) -> Self:
-        return self._apply_with(operator.mod, other)
-
-    def __pow__(self, other: int | StateNumber[int]) -> StateInt:
-        if (value := self.get(0)) < 0:
-            raise ValueError(f'{value!r} < 0')
-
-        return self._map_with(operator.pow, other, '{} ** {}')
-
-    def __rpow__(self, other: int | StateNumber[int]) -> StateInt:
-        if other < 0:
-            raise ValueError(f'{other!r} < 0')
-
-        return self._map_with(operator.pow, other, '{} % {}', reverse=True)
-
-    def __ipow__(self, other: int) -> Self:
-        if other < 0:
-            raise ValueError(f'{other!r} < 0')
-
-        return self._apply_with(operator.pow, other)
-
-    def _map_with(
-        self,
-        op: Callable[[int, _S], Any],
-        other: StateVar[_S] | _S,
-        name: str | None = None,
-        reverse: bool = False,
-        cls: type[_SN] | None = None
-    ) -> _SN:
-        if cls is None:
-            cls = StateInt
-
-        if isinstance(other, StateVar):
-            args = (other, self) if reverse else (self, other)
-            return cls(
-                StateTuple(args).starmap(op),
-                name=name.format(args[0].name, args[1].name) if name else None
-            )
-
-        if reverse:
-            names = repr(other), self._name
-            producer = self._map(lambda a: op(other, a))
-        else:
-            names = self._name, repr(other)
-            producer = self._map(lambda a: op(a, other))
-
-        return cls(
-            producer,
-            name=name.format(*names) if name else None,
-        )
-
-    def _apply(self, op: Callable[[_N], int]) -> Self:
-        """In-place analogue of map()"""
-        res = self._coerce(op(self.get()))
-        self.set(res)
-
-        return self
-
-    def _apply_with(
-        self, op:
-        Callable[[_N, int], int],
-        other: _N
-    ) -> Self:
-        """In-place analogue of map_with()"""
-        if not isinstance(other, int):
-            raise TypeError(f'expected an int, got {type(other).__name__!r}')
-
-        res = self._coerce(op(self.get(), other))
-        self.set(res)
-
-        return self
-
-    @abc.abstractmethod
-    def _coerce(self, other: int) -> _N: ...
-
-    def _set(self, value: _S, always: bool = False) -> None:
-        super()._set(self._coerce(value))
-
-    async def _wait(self) -> _N:
-        async for num in self:
-            if num:
-                return num
-
-            await asyncio.sleep(0)
-
-        raise LookupError(repr(self))
-
-
-class StateInt(StateNumber[int]):
-    __slots__ = ()
-
-    def __init__(
-        self,
-        producer: Maybe[int | StateVar[int] | AsyncIterable[int]] = None,
-        *,
-        name: str | None = None,
-        start: int | None = None,
-    ) -> None:
-        super().__init__(producer, name=name, start=start)
-
-    def __lt__(self, other: int | StateInt) -> StateBool:
-        return self._map_with(operator.lt, other, '{} < {}', cls=StateBool)
-
-    def __le__(self, other: int | StateInt) -> StateBool:
-        return self._map_with(operator.le, other, '{} <= {}', cls=StateBool)
-
-    def __gt__(self, other: int | StateInt) -> StateBool:
-        return self._map_with(operator.gt, other, '{} > {}', cls=StateBool)
-
-    def __ge__(self, other: int | StateInt) -> StateBool:
-        return self._map_with(operator.ge, other, '{} >= {}', cls=StateBool)
-
-    def _coerce(self, other: int) -> int:
-        return int(other)
-
-    def _equals(self, state: int) -> bool:
-        return self.get() == int(state)
-
-
-class StateBool(StateNumber[bool]):
-    __slots__ = ()
-
-    def __init__(
-        self,
-        producer: Maybe[bool | StateVar[bool] | AsyncIterable[bool]],
-        *,
-        name: str | None = None,
-        start: int | None = None,
-        default: bool = False,
-    ) -> None:
-        super().__init__(producer, name=name, start=start)
-
-    def __inv__(self) -> StateBool:
-        async def _inv():
-            async for b in self:
-                yield not b
-
-        return StateBool(_inv(), name=f'not {self._name}')
-
-    @overload
-    def __and__(self, other: bool | StateBool) -> StateBool: ...
-    @overload
-    def __and__(self, other: int | StateInt) -> StateInt: ...
-
-    def __and__(
-        self,
-        other: bool | int | StateBool | StateInt
-    ) -> StateBool | StateInt:
-        cls = StateBool if isinstance(other, (bool, StateBool)) else StateInt
-        return self._map_with(operator.and_, other, '{} and {}', cls=cls)
-
-    @overload
-    def __or__(self, other: bool | StateBool) -> StateBool: ...
-    @overload
-    def __or__(self, other: int | StateInt) -> StateInt: ...
-
-    def __or__(
-        self,
-        other: bool | int | StateBool | StateInt
-    ) -> StateBool | StateInt:
-        cls = StateBool if isinstance(other, (bool, StateBool)) else StateInt
-        return self._map_with(operator.or_, other, '{} or {}', cls=cls)
-
-    __rand__ = __and__
-    __ror__ = __or__
-
-    not_ = __inv__
-    and_ = __and__
-    or_ = __or__
-
-    def _coerce(self, other: int) -> bool:
-        return bool(other)
-
-    def _equals(self, state: bool) -> bool:
-        return self.get() is bool(state)
-
-
-class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
+class StateTuple(
+    StateCollection[int, _S, tuple[_S, ...]],
+    Sequence[_S],
+    Generic[_S],
+):
     __slots__ = ('_states', )
 
     _states: tuple[StateVar[_S], ...]
 
     def __init__(
         self,
-        producers: int | Iterable[StateVar[_S] | AsyncIterable[_S]],
+        producers: int | Iterable[AsyncIterable[_S]] | AsyncIterable[_S],
     ) -> None:
-        # TODO key
         super().__init__()
 
         if isinstance(producers, int):
             states = [StateVar() for _ in range(producers)]
+        elif isinstance(producers, AsyncIterable):
+            # TODO
+            raise NotImplementedError
         else:
             states = []
             for producer in producers:
@@ -541,8 +219,8 @@ class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
 
         self._states = tuple(states)
 
-    def __hash__(self) -> int:
-        return hash(self._states)
+    def __iter__(self):
+        return iter(self._states)
 
     def __contains__(self, item: object) -> bool:
         if isinstance(item, State):
@@ -592,23 +270,28 @@ class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
         self,
         index: int | tuple[int] | slice
     ) -> State[_S] | StateTuple[_S]:
+        states = self._states
         if isinstance(index, int):
-            return super().__getitem__(index)
+            return states[index]
         elif isinstance(index, tuple):
-            return type(self)(self[i] for i in index)
+            return type(self)(states[i] for i in index)
         elif isinstance(index, slice):
-            return type(self)(self[i] for i in range(*index.indices(len(self))))
+            return type(self)(
+                states[i] for i in range(*index.indices(len(states)))
+            )
         else:
             raise TypeError(
                 f'{type(self).__name__} indices must be integers or slices, '
                 f'not {type(index).__name__}'
             )
 
-    def __setitem__(self, key: int, value: StateVar[_S] | _S):
-        if isinstance(value, StateVar):
-            self[key].set_from(value)
+    def __setitem__(self, index: int, value: State[_S] | _S):
+        state = self._states[index]
+
+        if isinstance(value, State):
+            state.set_from(value)
         else:
-            self[key].set(value)
+            state.set(value)
 
     @property
     def readonly(self) -> bool:
@@ -617,29 +300,23 @@ class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
         """
         return True
 
-    def get(self, key: int, default: Maybe[_T] = Nothing) -> _S | _T:
+    def get(self, index: int, default: Maybe[_T] = Nothing) -> _S | _T:
         # noinspection PyProtectedMember
-        return self._states[key]._get(default)
+        return self._states[index].get(default)
 
-    def map(
-        self,
-        function: Union[
-            Callable[[tuple[_S, ...]], _RS],
-            Callable[[tuple[_S, ...]], Awaitable[_RS]]
-        ],
-        *,
-        key: Callable[[_RS], Comparable] = lambda r: r
-    ) -> StateVar[_RS]:
-        return StateVar(cast(AsyncIterator[_RS], self._map(function)), key=key)
+    def map(self, function, cls=None, *cls_args, **cls_kwargs):
+        if cls is None:
+            cls = StateVar
+        return super().map(function, cls, *cls_args, **cls_kwargs)
 
     def starmap(
         self,
-        function: Callable[..., _RS] | Callable[..., Awaitable[_RS]],
-        *,
-        key: Callable[[_RS], Comparable] = lambda r: r,
-    ) -> StateVar[_RS]:
-        itr = cast(AsyncIterator[_RS], self._map(lambda args: function(*args)))
-        return StateVar(itr, key=key)
+        function: Callable[..., Awaitable[_RS]] | Callable[..., _RS],
+        cls: type[State[_RS]] | None = None,
+        *cls_args: Any,
+        **cls_kwargs: Any,
+    ) -> State[_RS]:
+        return self.map(lambda ss: function(*ss), cls, *cls_args, **cls_kwargs)
 
     # PyCharm doesn't understand walrus precedence:
     # noinspection PyRedundantParentheses
@@ -653,22 +330,21 @@ class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
         except StopAsyncIteration:
             pass
 
-    def _get_states(self) -> tuple[StateVar[_S], ...]:
-        return self._states
+    def _get_states(self) -> Mapping[int, State[_S]]:
+        return {i: s for i, s in enumerate(self._states)}
 
     def _get_data(self, default: Maybe[_S] = Nothing) -> tuple[_S, ...]:
         return tuple(sv.get(default) for sv in self._states)
 
 
 class StateDict(
-    Mapping[_K, State[_S]],
     StateCollection[_K, _S, dict[_K, _S]],
+    Mapping[_K, State[_S]],
     Generic[_K, _S],
 ):
-    __slots__ = ('_states', '_count')
+    __slots__ = ('_states',)
 
     _states: dict[_K, State[_S]]
-    _count: Final[StateInt]
 
     def __init__(
         self,
@@ -684,6 +360,8 @@ class StateDict(
 
         super().__init__()
 
+        self._future.set_result({})
+
         self._states = {}
         for key, state in states.items():
             if not isinstance(state, State):
@@ -696,13 +374,14 @@ class StateDict(
 
             self._states[key] = state
 
-        self._count = StateInt(self._get_counter(), name=f'len({self!r})')
+    def __bool__(self) -> bool:
+        return len(self) > 0
 
-    def __len__(self) -> StateInt:
-        return self._count
+    def __iter__(self):
+        return iter(self._get_states())
 
-    def __contains__(self, key: _K) -> bool:
-        return key in self._states and key in self._items_set
+    def __contains__(self, key: object) -> bool:
+        return key in self._states and self._states[key].is_set
 
     def __getitem__(self, key: _K) -> State[_S]:
         states = self._states
@@ -712,21 +391,28 @@ class StateDict(
         return self.__missing__(key)
 
     def __setitem__(self, key: _K, value: State[_S] | _S) -> None:
+        if self._producer is not Nothing:
+            raise StateError(f'{self!r} is readonly')
+
         if isinstance(value, State):
             if key in self._states:
                 state = self._states[key]
-                if key in self._items_set or not isinstance(state, StateVar):
-                    raise KeyError(f'{key!r} already set')
 
-                state.set_from(value)
+                if state.is_set:
+                    raise KeyError(f'{key!r} already set: {state}')
+
+                state._set_from(value)
 
             else:
                 self._states[key] = value
                 value._collections.append((key, self))
         else:
-            self[key].set(key)
+            self[key]._set(value)
 
     def __delitem__(self, key: _K) -> None:
+        if self._producer is not Nothing:
+            raise StateError(f'{self!r} is readonly')
+
         if key in self._states:
             state = self._states[key]
             state._cancel()
@@ -741,30 +427,33 @@ class StateDict(
 
     def __missing__(self, key: _K) -> StateVar[_S]:
         assert key not in self._states
-        state = StateVar()
+
+        state = self._states[key] = StateVar()
         state._collections.append((key, self))
-        self._states[key] = state
+
         return state
 
-    def items(self) -> ItemsView[_K, _S]:
-        return self._get_states().items()
+    def get(
+        self,
+        key: Maybe[_K] = Nothing,
+        default: Maybe[_T] = Nothing
+    ) -> _S | _T | dict[_K, _S]:
+        if key is Nothing:
+            if default is not Nothing:
+                raise TypeError('default cannot be set if no key is passed')
 
-    def keys(self) -> KeysView[_K]:
-        return self._get_states().keys()
+            return self._get_data()
 
-    def values(self) -> ValuesView[_S]:
-        return self._get_states().values()
+        return super().get(key, default=default)
 
-    @overload
-    @abc.abstractmethod
-    def get(self, key: _K, default: NothingType = ...) -> _S: ...
+    def keys(self, is_set: bool = True) -> KeysView[_K]:
+        return self._get_states(is_set).keys()
 
-    @overload
-    @abc.abstractmethod
-    def get(self, key: _K, default: _T = ...) -> _S | _T: ...
+    def values(self, is_set: bool = True) -> ValuesView[State[_S]]:
+        return self._get_states(is_set).values()
 
-    def get(self, key: _K, default: Maybe[_T] = Nothing) -> _S | _T:
-        return self._states[key]._get(default)
+    def items(self, is_set: bool = True) -> ItemsView[_K, State[_S]]:
+        return self._get_states(is_set).items()
 
     def clear(self) -> None:
         states = self._states
@@ -774,22 +463,48 @@ class StateDict(
 
         self._states.clear()
 
-    def _get_states(self) -> dict[_K, State[_S]]:
-        return {
-            k: s for k, s in self._states.items()
-            if s.future.done() and not s.future.cancelled()
-        }
+    def _get_states(self, is_set: bool = True) -> dict[_K, State[_S]]:
+        if is_set:
+            return {k: s for k, s in self._states.items() if s.is_set}
+        else:
+            return self._states
 
     def _get_data(self, default: Maybe[_T] = Nothing) -> dict[_K, _S | _T]:
         if default is Nothing:
-            return {k: s for k, s in self._states if k in self._items_set}
+            return {k: s for k, s in self._states.items() if s.is_set}
 
         # noinspection PyProtectedMember
         return {k: s._get(default) for k, s in self._states}
 
-    def _get_counter(self):
-        async def _producer():
+    def _get_counter(self) -> StateVar[int]:
+        async def _producer() -> AsyncIterable[int]:
             async for _ in self:
                 yield len(self._get_states())
 
-        return StateInt(_producer())
+        return StateVar[int](_producer())
+
+
+def statefunction(
+    function: Callable[..., Awaitable[_RS]] | Callable[..., _RS],
+    cls: type[State] = StateVar,
+    *cls_args: Any,
+    **cls_kwargs: Any,
+) -> Callable[..., State[_RS]]:
+
+    @functools.wraps(function)
+    def statemap(*args: State[_S]) -> State[_RS]:
+        if len(args) == 0:
+            raise TypeError('at least one argument expected')
+
+        if len(args) == 1:
+            return args[0].map(function, cls, *cls_args, **cls_kwargs)
+
+        return StateTuple(args).starmap(function, cls, *cls_args, **cls_kwargs)
+
+    hints = get_type_hints(getattr(function, '__call__', function))
+    statemap.__annotations__ = {
+        k: get_origin(cls)[v] if k == 'return' else State[v]
+        for k, v in hints.items()
+    }
+
+    return statemap

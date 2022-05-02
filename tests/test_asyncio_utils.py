@@ -10,7 +10,7 @@ async def test_race():
             yield i
             await asyncio.sleep(dt)
 
-    dt = 0.01
+    dt = 0.05
     n = 3
 
     it_0_2 = slowrange(dt * 0, dt * 2, n)

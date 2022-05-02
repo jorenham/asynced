@@ -9,8 +9,10 @@ __all__ = (
     'OneOrMany',
     'ObjOrType',
 
-    'Catchable', 'CatchableE',
-    'Throwable', 'ThrowableE',
+    'Catchable',
+    'CatchableE',
+    'Throwable',
+    'ThrowableE',
 
     'Maybe',
     'Nothing',
@@ -18,11 +20,13 @@ __all__ = (
 
     'awaitable',
     'acallable',
+    'ishashclass',
 )
 
 import asyncio
 import enum
 import inspect
+
 from typing import (
     Any,
     Awaitable,
@@ -30,8 +34,14 @@ from typing import (
     Coroutine,
     final,
     Final,
-    Iterable, Iterator, Literal,
-    overload, Protocol, TypeVar,
+    get_args,
+    get_origin,
+    Hashable,
+    Iterator,
+    Literal,
+    overload,
+    Protocol,
+    TypeVar,
     Union,
 )
 
@@ -121,6 +131,9 @@ Maybe: TypeAlias = Union[_T, NothingType]
 
 def awaitable(arg: _T) -> TypeGuard[Awaitable[_T]]:
     """Type guard objects that can be used in an 'await ...' expression."""
+    if isinstance(arg, type):
+        return False
+
     if asyncio.isfuture(arg):
         return True
 
@@ -133,3 +146,18 @@ def awaitable(arg: _T) -> TypeGuard[Awaitable[_T]]:
 def acallable(arg: Any) -> TypeGuard[Callable[..., Coroutine[Any, Any, Any]]]:
     """Type guard for coroutine (async) functions"""
     return callable(arg) and asyncio.iscoroutinefunction(arg)
+
+
+def ishashclass(cls: type[Any]) -> TypeGuard[Hashable]:
+    """Return True if the class and its generic type args are hashable."""
+    try:
+        return issubclass(cls, Hashable)
+    except TypeError:
+        if (cls_orig := get_origin(cls)) is None:
+            raise
+
+        if not issubclass(cls_orig, Hashable):
+            return False
+
+        # recurse on the generic type args
+        return all(map(ishashclass, get_args(cls)))

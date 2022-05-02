@@ -1,0 +1,49 @@
+import asyncio
+import math
+
+from asynced import statefunction, StateVar
+
+
+async def test_unary_statevar():
+    slen = statefunction(len)
+    s = StateVar()
+    sl = slen(s)
+
+    assert not sl.is_set
+
+    s.set('spam')
+    await asyncio.sleep(0)
+
+    assert sl.is_set
+    assert await sl == 4
+    assert await slen(s) == 4
+
+    s.set('ham')
+    await asyncio.sleep(0)
+
+    assert await sl == 3
+    assert await slen(s) == 3
+
+
+async def test_binary_statevar():
+    get_c = statefunction(lambda _a, _b: math.sqrt(_a**2 + _b**2))
+
+    a = StateVar()
+    b = StateVar()
+    c = get_c(a, b)
+
+    assert not c.is_set
+
+    a.set(3)
+    await asyncio.sleep(0)
+
+    assert not c.is_set
+
+    b.set(4)
+    await asyncio.sleep(0)
+
+    assert c.is_set
+    assert await c == 5.0
+
+    # TODO
+    # assert await get_c(a, b) == 5.0

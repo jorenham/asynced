@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import functools
+import inspect
 
 __all__ = (
+    'amap_iter',
     'race',
     'resume',
 
@@ -19,9 +21,12 @@ from typing import (
     Any,
     AsyncIterable,
     AsyncIterator,
+    Awaitable,
     Callable,
-    cast, Coroutine,
-    Literal, overload,
+    cast,
+    Coroutine,
+    Literal,
+    overload,
     TypeVar,
 )
 from typing_extensions import ParamSpec
@@ -45,6 +50,27 @@ async def resume(result: _T = ...) -> _T: ...
 async def resume(result: _T | None = None) -> _T | None:
     """Pass control back to the event loop"""
     return await asyncio.sleep(0, result)
+
+
+def amap_iter(
+    function: Callable[[_T], _R] | Callable[[_T], Awaitable[_R]],
+    iterable: AsyncIterable[_T],
+) -> AsyncIterable[_R]:
+    async def _iterable() -> AsyncIterable[_R]:
+        is_async = asyncio.iscoroutinefunction(function) or None
+
+        async for value in iterable:
+            res = function(value)
+
+            if is_async is None:
+                is_async = inspect.isawaitable(res)
+
+            if is_async:
+                yield await cast(Awaitable[_R], res)
+            else:
+                yield cast(_R, res)
+
+    return _iterable()
 
 
 @overload

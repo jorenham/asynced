@@ -10,6 +10,7 @@ from asynced.compat import aiter, anext
 
 DT: Final[float] = 0.01
 
+
 # @pytest.fixture(scope='function', autouse=True)
 # def timeout_1s():
 #     return 1.0
@@ -19,11 +20,15 @@ async def test_initial():
     s0, s1 = StateVar(), StateVar()
     s = StateTuple((s0, s1))
 
-    assert not bool(s.is_set)
-    assert not bool(s.is_done)
-    assert not bool(s.is_stopped)
-    assert not bool(s.is_error)
-    assert not bool(s.is_cancelled)
+    assert not s.is_set
+    assert not s.is_done
+    assert not s.is_stopped
+
+    assert not s.all_error
+    assert not s.any_error
+    assert not s.is_error
+
+    assert not s.is_cancelled
 
     o = 'O'
     assert s.get(0, o) == s.get(1, o) == o
@@ -92,14 +97,14 @@ async def test_set_single():
 
     s[0] = 'spam'
 
+    assert (await s) == ('spam',)
     assert (await s[0]) == 'spam'
     assert s[0].get() == 'spam'
 
     assert s.get(0) == 'spam'
-    assert (await s) == ('spam',)
 
-    assert bool(s.is_set)
-    assert bool(s.any_set)
+    assert s.any_set
+    assert s.all_set
 
 
 async def test_set_multi():
@@ -111,8 +116,8 @@ async def test_set_multi():
     assert s[0].get() == 'spam'
     assert s[0].is_set
 
-    assert bool(s.any_set)
-    assert not bool(s.is_set)
+    assert s.any_set
+    assert not s.all_set
 
     assert s.get(0) == 'spam'
 
@@ -165,12 +170,21 @@ async def test_producers_single_empty():
     ss = [v async for v, in s]
     assert not len(ss)
 
-    assert not s.any_set
     assert not s.is_set
+    assert not s.all_set
+    assert not s.any_set
+
+    assert s.any_done
+    assert s.all_done
     assert s.is_done
-    assert s.is_stopped
+
     assert not s.is_error
+    assert not s.all_error
+    assert not s.any_error
+
     assert not s.is_cancelled
+    assert not s.all_cancelled
+    assert not s.any_cancelled
 
 
 async def test_producers_single_stop():
@@ -182,17 +196,32 @@ async def test_producers_single_stop():
         yield 'eggs'
         await asyncio.sleep(DT)
 
-    s = StateTuple([producer()])
+    s = StateTuple[str]([producer()])
+
+    assert len(s) == 1
+    assert not s.any_set
+    assert not s.all_set
+    assert not s.any_done
+    assert not s.all_done
+
     ss = [v async for v, in s]
 
-    assert len(ss) == 3
     assert ss == ['spam', 'ham', 'eggs']
 
+    assert s[0].is_set
     assert s.is_set
+    assert s.any_set
+    assert s.all_set
+
+    assert s[0].is_done
     assert s.is_done
-    assert s.is_stopped
+    assert s.any_done
+    assert s.all_done
+
+    assert not s[0].is_error
     assert not s.is_error
-    assert not s.is_cancelled
+    assert not s.any_error
+    assert not s.all_error
 
 
 async def test_producers_single_error():
@@ -205,11 +234,14 @@ async def test_producers_single_error():
     with pytest.raises(ZeroDivisionError):
         await s
 
-    assert s.any_error
+    assert s[0].is_error
     assert s.is_error
+    assert s.any_error
+    assert s.all_error
+
     assert s.is_done
     assert not s.is_set
-    assert not s.is_stopped
+
     assert not s.is_cancelled
 
     with pytest.raises(ZeroDivisionError):
@@ -225,7 +257,6 @@ async def test_producers_single_set_and_error():
 
     s = StateTuple([producer()])
     ss = aiter(s)
-    dict()
 
     assert await anext(ss) == (1, )
     with pytest.raises(ZeroDivisionError):
@@ -236,12 +267,13 @@ async def test_producers_single_set_and_error():
 
     with pytest.raises(ZeroDivisionError):
         await s[0]
-
-    assert s.any_set
+    #
+    # assert s[0].is_set
+    # assert s.is_set
     assert s.any_error
     assert s.is_error
     assert s.is_done
-    assert not s.is_stopped
+    # assert not s.is_stopped
     assert not s.is_cancelled
 
     with pytest.raises(ZeroDivisionError):
@@ -263,11 +295,6 @@ async def test_producers_interleaved_stop():
         await asyncio.sleep(DT)
 
     s = StateTuple([eggs(), bacon()])
-    # si = aiter(s)
-    #
-    # assert await anext(si) == ('eggs', 'bacon')
-    # assert await anext(si) == ('EGGS', 'bacon')
-    # assert await anext(si) == ('EGGS', 'BACON')
 
     t0 = time.monotonic()
     ss = [v async for v in s]
@@ -327,13 +354,13 @@ async def test_producers_interleaved_error():
     assert s[0].is_done
     assert s[1].is_done
 
-    assert not s[0].is_error
+    assert s[0].is_error
     assert s[1].is_error
 
     assert s.any_error
     assert s.is_error
 
-    assert s[0].is_stopped
+    assert not s[0].is_stopped
     assert not s[1].is_stopped
 
     assert not s.any_stopped
