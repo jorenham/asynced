@@ -227,6 +227,18 @@ async def test_iterable_map():
     assert s2_list == [1, 4, 9]
 
 
+async def test_initial_map():
+    s = StateVar()
+    s.set(21)
+    s2 = s.map(lambda x: x * 2)
+
+    assert s.is_set
+    assert s2.is_set
+
+    assert s.get() == 21
+    assert s2.get() == 42
+
+
 async def test_iterable_empty():
     s = StateVar(slowrange(DT, 0))
     s_list = [x async for x in s]

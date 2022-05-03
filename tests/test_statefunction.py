@@ -1,5 +1,6 @@
 import asyncio
 import math
+import operator
 
 from asynced import statefunction, StateVar
 
@@ -45,5 +46,20 @@ async def test_binary_statevar():
     assert c.is_set
     assert await c == 5.0
 
-    # TODO
-    # assert await get_c(a, b) == 5.0
+
+async def test_binary_initial():
+    a = StateVar()
+    b = StateVar()
+
+    a.set(5)
+    b.set(37)
+
+    c = statefunction(operator.add)(a, b)
+
+    assert a.is_set
+    assert b.is_set
+    assert c.is_set
+
+    assert a.get() == 5
+    assert b.get() == 37
+    assert c.get() == 42

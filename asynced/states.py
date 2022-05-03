@@ -219,6 +219,9 @@ class StateTuple(
 
         self._states = tuple(states)
 
+        if not self.is_set and all(s.is_set for s in states):
+            self._set(tuple(s.get() for s in states))
+
     def __iter__(self):
         return iter(self._states)
 
@@ -307,6 +310,7 @@ class StateTuple(
     def map(self, function, cls=None, *cls_args, **cls_kwargs):
         if cls is None:
             cls = StateVar
+
         return super().map(function, cls, *cls_args, **cls_kwargs)
 
     def starmap(
@@ -482,6 +486,26 @@ class StateDict(
                 yield len(self._get_states())
 
         return StateVar[int](_producer())
+
+
+_SS = TypeVar('_SS', bound=State)
+
+
+@overload
+def statefunction(
+    function: Callable[..., Awaitable[_RS]] | Callable[..., _RS],
+) -> StateVar[_RS]:
+    ...
+
+
+@overload
+def statefunction(
+    function: Callable[..., Awaitable[_RS]] | Callable[..., _RS],
+    cls: type[_SS] = ...,
+    *cls_args: Any,
+    **cls_kwargs: Any,
+) -> _SS:
+    ...
 
 
 def statefunction(

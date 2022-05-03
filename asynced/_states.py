@@ -413,7 +413,12 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             cls = type(self)
 
         res = cls(*cls_args, **cls_kwargs)
+
+        if self.is_set:
+            res._set(function(self._get()))
+
         res._set_from(amap_iter(function, self))
+
         return res
 
     async def _consume(self) -> None | NoReturn:
