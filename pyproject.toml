@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "asynced"
-version = "0.2.1"
+version = "1.0.0"
 description = "Async python for Event-Driven applications"
 authors = ["Joren Hammudoglu <jhammudoglu@gmail.com>"]
 license = "MIT"
@@ -23,7 +23,6 @@ exclude = [
     ".git",
     "**/__pycache__",
     "**/.pytest_cache",
-    "examples",
     "dist",
 ]
 venv = ".venv"
