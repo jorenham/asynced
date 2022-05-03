@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "asynced"
-version = "0.2.1"
+version = "1.0.0"
 description = "Async python for Event-Driven applications"
 authors = ["Joren Hammudoglu <jhammudoglu@gmail.com>"]
 license = "MIT"
@@ -9,29 +9,34 @@ repository = "https://github.com/jorenham/asynced"
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4"
-typing-extensions = ">4.1.0"
+mainpy = "^1.0"
+typing-extensions = "^4.2"
 
 [tool.poetry.dev-dependencies]
+pyright = "^1.1"
 pytest = "^7.1"
 pytest-asyncio = "^0.18"
-pyright = "^1.1.231"
-
-[tool.mypy]
-python_version = "3.9"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = true
-exclude = ["tests/", "examples/"]
 
 [tool.pyright]
-include = ["asynced/"]
-stubPath = ""
-venvPath = "."
-venv = ".venv/"
+include = ["asynced"]
+exclude = [
+    ".git",
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "dist",
+]
+venv = ".venv"
+
 pythonVersion = "3.9"
+pythonPlatform = "Linux"
+
+executionEnvironments = [
+  { root = "asynced" }
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+addopts = "--maxfail=1"
 
 
 [build-system]
