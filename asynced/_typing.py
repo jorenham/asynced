@@ -83,7 +83,7 @@ ThrowableE: TypeAlias = Throwable[Exception]
 
 
 class Comparable(Protocol):
-    def __eq__(self, other: Any) -> bool: ...
+    def __eq__(self, __o: object, /) -> bool: ...
 
 
 class ItemCollection(Protocol[_KT_contra, _T_co]):

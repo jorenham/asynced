@@ -4,10 +4,11 @@ __all__ = ('StateBase', 'State', 'StateCollection')
 
 import abc
 import asyncio
+import inspect
 import itertools
 from typing import (
     AsyncIterable,
-    Mapping, overload,
+    cast, Mapping, overload,
     Any,
     AsyncIterator,
     Awaitable,
@@ -26,7 +27,7 @@ from typing import (
 from typing_extensions import ParamSpec, Self, TypeAlias
 
 from . import amap_iter
-from ._typing import Comparable, Maybe, Nothing, NothingType
+from ._typing import awaitable, Comparable, Maybe, Nothing, NothingType
 from .exceptions import StopAnyIteration, StateError
 
 _T = TypeVar('_T')
@@ -47,7 +48,7 @@ _DoneStatus: TypeAlias = Literal['stop', 'error', 'cancel']
 _DONE_STATUS_KEYS: Final[tuple[_DoneStatus, ...]] = 'stop', 'error', 'cancel'
 
 
-_ST = TypeVar('_ST', bound='State', covariant=True)
+_ST = TypeVar('_ST', bound='State')
 
 
 class StateBase(Generic[_S]):
@@ -60,9 +61,12 @@ class StateBase(Generic[_S]):
         self.__future = None
 
     def __del__(self):
+        if (future := self.__future) is None:
+            return
+
         try:
-            self.__future.cancel()
-        except (AttributeError, RuntimeError):
+            future.cancel()
+        except RuntimeError:
             pass
 
     def __await__(self) -> Generator[Any, None, _S]:
@@ -155,7 +159,7 @@ class StateBase(Generic[_S]):
         except AttributeError:
             return
 
-        if not future.done():
+        if future is None or not future.done():
             return
 
         future.result()  # in case of exceptions raises 'em
@@ -175,7 +179,7 @@ class StateBase(Generic[_S]):
         self._on_cancel()
 
     def _on_set(self, value: Maybe[object] = Nothing) -> None:
-        self._is_set = True
+        ...
 
     def _on_error(self, exc: BaseException) -> None:
         ...
@@ -272,12 +276,12 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         self.__propositions__.clear()
         self._collections.clear()
 
-    def __eq__(self, other: object):
+    def __eq__(self, other: State[_S] | _S) -> bool:
         if not self.is_set:
             return False
 
         value = self._get()
-        return value is other or value == other
+        return bool(value is other or value == other)
 
     def __aiter__(self) -> AsyncIterator[_S]:
         async def _aiter():
@@ -321,7 +325,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         finally:
             del self._waiters[waiter_id]
 
-    __hash__ = None
+    __hash__ = None  # type: ignore
 
     @property
     def readonly(self) -> bool:
@@ -351,52 +355,37 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         return self._is_cancelled
 
     @overload
+    def map(self, function: Callable[[_S], Awaitable[_S]]) -> Self: ...
+    @overload
+    def map(self, function: Callable[[_S], _S]) -> Self: ...
+
+    @overload
     def map(
         self,
-        function: Callable[[_S], Awaitable[_S]],
-        cls: None = ...,
+        function: Callable[[_S], Awaitable[object]],
+        cls: type[_ST],
         *cls_args: Any,
         **cls_kwargs: Any,
-    ) -> Self:
+    ) -> _ST:
         ...
 
     @overload
     def map(
         self,
-        function: Callable[[_S], _S],
-        cls: None = ...,
+        function: Callable[[_S], object],
+        cls: type[_ST],
         *cls_args: Any,
         **cls_kwargs: Any,
-    ) -> Self:
-        ...
-
-    @overload
-    def map(
-        self,
-        function: Callable[[_S], Awaitable[_RS]],
-        cls: type[State[_RS]],
-        *cls_args: Any,
-        **cls_kwargs: Any,
-    ) -> State[_RS]:
-        ...
-
-    @overload
-    def map(
-        self,
-        function: Callable[[_S], _RS],
-        cls: type[State[_RS]] | None = ...,
-        *cls_args: Any,
-        **cls_kwargs: Any,
-    ) -> State[_RS]:
+    ) -> _ST:
         ...
 
     def map(
         self,
         function: Callable[[_S], Awaitable[_RS]] | Callable[[_S], _RS],
-        cls: type[State[_RS]] | None = None,
+        cls: type[_ST] | None = None,
         *cls_args: Any,
         **cls_kwargs: Any,
-    ) -> State[_RS]:
+    ) -> _ST:
         """Create a new instance from this state, with the function applied to
         its value.
 
@@ -409,13 +398,21 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         if 'name' not in cls_kwargs:
             cls_kwargs['name'] = f'{function.__name__}({self})'
 
+        res: _ST
         if cls is None:
-            cls = type(self)
-
-        res = cls(*cls_args, **cls_kwargs)
+            res = cast(_ST, type(self)(*cls_args, **cls_kwargs))
+        else:
+            res = cls(*cls_args, **cls_kwargs)
 
         if self.is_set:
-            res._set(function(self._get()))
+            initial = function(self._get())
+            if awaitable(initial):
+                async def _set_after():
+                    res._set(cast(_RS, await initial))
+
+                asyncio.create_task(_set_after())
+            else:
+                res._set(cast(_RS, initial))
 
         res._set_from(amap_iter(function, self))
 
@@ -489,7 +486,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         task_name = f'{self}.consumer'
         self._consumer = asyncio.create_task(self._consume(), name=task_name)
 
-    def _set_apply(self, function: Callable[[_SS], _SS]) -> _SS:
+    def _set_apply(self, function: Callable[[_S], _S]) -> _S:
         """Apply the function to the current state value and return it."""
         # TODO support async functions
         state = function(self._get())
@@ -544,6 +541,9 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         key_current = self._key(future.result())
 
         return key is key_current or key == key_current
+
+    def _on_set(self, value: Maybe[object] = Nothing) -> None:
+        self._is_set = True
 
     def _on_stop(self) -> None:
         self._is_stopped = True

@@ -18,7 +18,7 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
-    ClassVar,
+    cast, ClassVar,
     Final,
     Generic,
     get_origin,
@@ -50,11 +50,8 @@ from .asyncio_utils import race
 _T = TypeVar('_T', bound=object)
 _K = TypeVar('_K')
 
-_S = TypeVar('_S', bound=Hashable)
-_S_co = TypeVar('_S_co', bound=Hashable, covariant=True)
-_N = TypeVar('_N', bool, int)
-
-_RS = TypeVar('_RS', bound=Hashable)
+_S = TypeVar('_S', bound=object)
+_RS = TypeVar('_RS', bound=object)
 
 _Counter: TypeAlias = Callable[[], int]
 
@@ -94,9 +91,9 @@ class StateVar(State[_S], Generic[_S]):
         return self._name
 
     @overload
-    def get(self, default: NothingType = ...) -> _S: ...
+    def get(self) -> _S: ...
     @overload
-    def get(self, default: _T = ...) -> _S | _T: ...
+    def get(self, default: _T) -> _S | _T: ...
 
     def get(self, default: Maybe[_T] = Nothing) -> _S | _T:
         """Return the current state value.
@@ -203,7 +200,7 @@ class StateTuple(
                         f'{type(producer).__name__!r} instead'
                     )
                 else:
-                    statevar = StateVar(producer)
+                    statevar = StateVar(cast(AsyncIterable[_S], producer))
 
                 # noinspection PyProtectedMember
                 states.append(statevar)
@@ -225,15 +222,11 @@ class StateTuple(
     def __iter__(self):
         return iter(self._states)
 
-    def __contains__(self, item: object) -> bool:
+    def __contains__(self, item: _S) -> bool:
         if isinstance(item, State):
             return item in self._states
 
-        default = object()
-        return item in tuple(
-            s for s in self._get_data(default)
-            if s is not default
-        )
+        return item in tuple(s.get() for s in self._states if s.is_set)
 
     def __reversed__(self) -> StateTuple[_S]:
         return self[::-1]
@@ -338,7 +331,10 @@ class StateTuple(
         return {i: s for i, s in enumerate(self._states)}
 
     def _get_data(self, default: Maybe[_S] = Nothing) -> tuple[_S, ...]:
-        return tuple(sv.get(default) for sv in self._states)
+        if default is Nothing:
+            return tuple(sv.get() for sv in self._states)
+        else:
+            return tuple(sv.get(default) for sv in self._states)
 
 
 class StateDict(
@@ -376,7 +372,7 @@ class StateDict(
 
             state._collections.append((key, self))
 
-            self._states[key] = state
+            self._states[cast(_K, key)] = state
 
     def __bool__(self) -> bool:
         return len(self) > 0
@@ -384,7 +380,7 @@ class StateDict(
     def __iter__(self):
         return iter(self._get_states())
 
-    def __contains__(self, key: object) -> bool:
+    def __contains__(self, key: _K) -> bool:
         return key in self._states and self._states[key].is_set
 
     def __getitem__(self, key: _K) -> State[_S]:
@@ -475,17 +471,10 @@ class StateDict(
 
     def _get_data(self, default: Maybe[_T] = Nothing) -> dict[_K, _S | _T]:
         if default is Nothing:
-            return {k: s for k, s in self._states.items() if s.is_set}
+            return {k: s._get() for k, s in self._states.items() if s.is_set}
 
         # noinspection PyProtectedMember
-        return {k: s._get(default) for k, s in self._states}
-
-    def _get_counter(self) -> StateVar[int]:
-        async def _producer() -> AsyncIterable[int]:
-            async for _ in self:
-                yield len(self._get_states())
-
-        return StateVar[int](_producer())
+        return {k: s._get(default) for k, s in self._states.items()}
 
 
 _SS = TypeVar('_SS', bound=State)
@@ -494,7 +483,7 @@ _SS = TypeVar('_SS', bound=State)
 @overload
 def statefunction(
     function: Callable[..., Awaitable[_RS]] | Callable[..., _RS],
-) -> StateVar[_RS]:
+) -> Callable[..., StateVar[_RS]]:
     ...
 
 
@@ -504,7 +493,7 @@ def statefunction(
     cls: type[_SS] = ...,
     *cls_args: Any,
     **cls_kwargs: Any,
-) -> _SS:
+) -> Callable[..., _SS]:
     ...
 
 
@@ -516,7 +505,7 @@ def statefunction(
 ) -> Callable[..., State[_RS]]:
 
     @functools.wraps(function)
-    def statemap(*args: State[_S]) -> State[_RS]:
+    def res(*args: State[_S]) -> State[_RS]:
         if len(args) == 0:
             raise TypeError('at least one argument expected')
 
@@ -526,9 +515,16 @@ def statefunction(
         return StateTuple(args).starmap(function, cls, *cls_args, **cls_kwargs)
 
     hints = get_type_hints(getattr(function, '__call__', function))
-    statemap.__annotations__ = {
-        k: get_origin(cls)[v] if k == 'return' else State[v]
-        for k, v in hints.items()
-    }
+    origin: type[State] = get_origin(cls) or cls
 
-    return statemap
+    res.__annotations__ = {
+        k: State[v] for k, v in hints.items() if k != 'return'
+    }
+    if 'return' in hints:
+        return_hint = origin[hints['return']]  # type: ignore
+    else:
+        return_hint = origin
+
+    res.__annotations__['return'] = return_hint
+
+    return res
