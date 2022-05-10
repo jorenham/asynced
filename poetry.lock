@@ -37,17 +37,6 @@ optional = false
 python-versions = "*"
 
 [[package]]
-name = "mainpy"
-version = "1.0.0"
-description = "Simplify your project's main entrypoint definition with @main"
-category = "main"
-optional = false
-python-versions = ">=3.7,<4.0"
-
-[package.dependencies]
-typing_extensions = {version = ">=4.1,<5.0", markers = "python_version < \"3.10\""}
-
-[[package]]
 name = "nodeenv"
 version = "1.6.0"
 description = "Node.js virtual environment builder"
@@ -99,7 +88,7 @@ diagrams = ["railroad-diagrams", "jinja2"]
 
 [[package]]
 name = "pyright"
-version = "1.1.243"
+version = "1.1.245"
 description = "Command line wrapper for pyright"
 category = "dev"
 optional = false
@@ -166,7 +155,7 @@ python-versions = ">=3.7"
 [metadata]
 lock-version = "1.1"
 python-versions = ">=3.9,<4"
-content-hash = "b9f333b6af8ab336794e13738f77b3d34d6d5787f6116586815762aae4b34dcf"
+content-hash = "6b3c7e616881315b2c2b819211ef0fae191aa90224c2e1ec57894d909e93eee6"
 
 [metadata.files]
 atomicwrites = [
@@ -184,10 +173,6 @@ colorama = [
 iniconfig = [
     {file = "iniconfig-1.1.1-py2.py3-none-any.whl", hash = "sha256:011e24c64b7f47f6ebd835bb12a743f2fbe9a26d4cecaa7f53bc4f35ee9da8b3"},
     {file = "iniconfig-1.1.1.tar.gz", hash = "sha256:bc3af051d7d14b2ee5ef9969666def0cd1a000e121eaea580d4a313df4b37f32"},
-]
-mainpy = [
-    {file = "mainpy-1.0.0-py3-none-any.whl", hash = "sha256:1810411c9c7d2954f9acd223bf828f64df5bac0d5d93d758a3d9ee817585930d"},
-    {file = "mainpy-1.0.0.tar.gz", hash = "sha256:c878d2a2c12565833ccd3a56467880e6bceedb1d8ef4f2fe2a6d8ec807471605"},
 ]
 nodeenv = [
     {file = "nodeenv-1.6.0-py2.py3-none-any.whl", hash = "sha256:621e6b7076565ddcacd2db0294c0381e01fd28945ab36bcf00f41c5daf63bef7"},
@@ -210,8 +195,8 @@ pyparsing = [
     {file = "pyparsing-3.0.8.tar.gz", hash = "sha256:7bf433498c016c4314268d95df76c81b842a4cb2b276fa3312cfb1e1d85f6954"},
 ]
 pyright = [
-    {file = "pyright-1.1.243-py3-none-any.whl", hash = "sha256:20404384cb7379e07ecf0931fa119d5d05b1c128b9fd237f64c42a7d7074c0a3"},
-    {file = "pyright-1.1.243.tar.gz", hash = "sha256:129f8b1775dfbca6db70d3456743ad797ef456a5f7b3d5c9ca9abbf02d74786d"},
+    {file = "pyright-1.1.245-py3-none-any.whl", hash = "sha256:1edfb44ea6318e4648e4d522d1d164774dd487e27cb954d202cbf7e9cf28d597"},
+    {file = "pyright-1.1.245.tar.gz", hash = "sha256:cbbd743f9de2b96b35a03b9b8f2d2b046f292c9967468b9a38132319954ddbf2"},
 ]
 pytest = [
     {file = "pytest-7.1.2-py3-none-any.whl", hash = "sha256:13d0e3ccfc2b6e26be000cb6568c832ba67ba32e719443bfe725814d3c42433c"},
