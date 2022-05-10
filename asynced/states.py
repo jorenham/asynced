@@ -18,12 +18,12 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
-    cast, ClassVar,
+    cast,
+    ClassVar,
     Final,
     Generic,
     get_origin,
     get_type_hints,
-    Hashable,
     ItemsView,
     Iterable,
     KeysView,
@@ -31,19 +31,13 @@ from typing import (
     overload,
     Sequence,
     TypeVar,
-    Union,
     ValuesView,
 )
 from typing_extensions import TypeAlias
 
 from . import StateError
 from ._states import State, StateCollection
-from ._typing import (
-    Comparable,
-    Maybe,
-    Nothing,
-    NothingType,
-)
+from ._typing import Comparable, Maybe, Nothing, NothingType
 from .asyncio_utils import race
 
 
@@ -337,36 +331,77 @@ class StateTuple(
             return tuple(sv.get(default) for sv in self._states)
 
 
+_StateMap: TypeAlias = Mapping[_K, StateVar[_S]]
+
+
 class StateDict(
     StateCollection[_K, _S, dict[_K, _S]],
-    Mapping[_K, State[_S]],
+    Mapping[_K, StateVar[_S]],
     Generic[_K, _S],
 ):
     __slots__ = ('_states',)
 
-    _states: dict[_K, State[_S]]
+    _states: dict[_K, StateVar[_S]]
+
+    @overload
+    def __init__(self, __arg: NothingType = ..., /): ...
+    @overload
+    def __init__(self, __arg: NothingType = ..., /, **__kw: StateVar[_S]): ...
+    @overload
+    def __init__(self, __arg: _StateMap[_K, _S], /): ...
+    @overload
+    def __init__(self, __arg: _StateMap[_K, _S], /, **__kw: StateVar[_S]): ...
+    @overload
+    def __init__(self, __arg: AsyncIterable[tuple[_K, _S]], /): ...
 
     def __init__(
         self,
-        mapping: Maybe[Union[
-            Mapping[_K, State[_S]],
-            AsyncIterable[tuple[_K, _S]]
-        ]] = Nothing,
+        mapping: Maybe[
+            Mapping[_K, StateVar[_S]] | AsyncIterable[tuple[_K, _S]]
+        ] = Nothing,
         /,
-        **states: State[_S],
-    ) -> None:
+        **states: StateVar[_S],
+    ):
         if mapping is not Nothing:
-            raise NotImplementedError('TODO')
+            if states:
+                raise TypeError(
+                    f'{type(self).__name__}() takes no keyword arguments when '
+                    f'an async iterable is given'
+                )
+
+        if mapping is Nothing:
+            initial_states = states
+        elif isinstance(mapping, Mapping):
+            initial_states = mapping | states
+        elif isinstance(mapping, AsyncIterable):
+            if states:
+                raise TypeError(
+                    f'{type(self).__name__}() takes no keyword arguments when '
+                    f'an async iterable is given'
+                )
+
+            # TODO
+            raise NotImplementedError('async iterables not supported yet')
+        else:
+            raise TypeError(
+                f'{type(mapping).__name__!r} object is not a mapping or '
+                f'async iterable'
+            )
 
         super().__init__()
 
-        self._future.set_result({})
+        initial = {}
+        for key, state in initial_states.items():
+            if state.is_set and not state.is_error:
+                initial[key] = state.get()
+
+        self._future.set_result(initial)
 
         self._states = {}
-        for key, state in states.items():
-            if not isinstance(state, State):
+        for key, state in initial_states.items():
+            if not isinstance(state, StateVar):
                 raise TypeError(
-                    f'expected a State or async iterables, got '
+                    f'expected a StateVar instance, got '
                     f'{type(state).__name__!r} instead'
                 )
 
@@ -383,18 +418,18 @@ class StateDict(
     def __contains__(self, key: _K) -> bool:
         return key in self._states and self._states[key].is_set
 
-    def __getitem__(self, key: _K) -> State[_S]:
+    def __getitem__(self, key: _K) -> StateVar[_S]:
         states = self._states
         if key in states:
             return states[key]
 
         return self.__missing__(key)
 
-    def __setitem__(self, key: _K, value: State[_S] | _S) -> None:
+    def __setitem__(self, key: _K, value: StateVar[_S] | _S) -> None:
         if self._producer is not Nothing:
             raise StateError(f'{self!r} is readonly')
 
-        if isinstance(value, State):
+        if isinstance(value, StateVar):
             if key in self._states:
                 state = self._states[key]
 
@@ -449,10 +484,10 @@ class StateDict(
     def keys(self, is_set: bool = True) -> KeysView[_K]:
         return self._get_states(is_set).keys()
 
-    def values(self, is_set: bool = True) -> ValuesView[State[_S]]:
+    def values(self, is_set: bool = True) -> ValuesView[StateVar[_S]]:
         return self._get_states(is_set).values()
 
-    def items(self, is_set: bool = True) -> ItemsView[_K, State[_S]]:
+    def items(self, is_set: bool = True) -> ItemsView[_K, StateVar[_S]]:
         return self._get_states(is_set).items()
 
     def clear(self) -> None:
@@ -463,7 +498,7 @@ class StateDict(
 
         self._states.clear()
 
-    def _get_states(self, is_set: bool = True) -> dict[_K, State[_S]]:
+    def _get_states(self, is_set: bool = True) -> dict[_K, StateVar[_S]]:
         if is_set:
             return {k: s for k, s in self._states.items() if s.is_set}
         else:
