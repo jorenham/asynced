@@ -29,7 +29,7 @@ from typing import (
     overload,
     Sequence,
     TypeVar,
-    ValuesView,
+    Union, ValuesView,
 )
 from typing_extensions import TypeAlias
 
@@ -339,12 +339,16 @@ class StateDict(
     def __init__(self, __arg: _StateMap[_K, _S], /, **__kw: StateVar[_S]): ...
     @overload
     def __init__(self, __arg: AsyncIterable[tuple[_K, _S]], /): ...
+    @overload
+    def __init__(self, __arg: AsyncIterable[tuple[_K, StateVar[_S]]], /): ...
 
     def __init__(
         self,
-        mapping: Maybe[
-            Mapping[_K, StateVar[_S]] | AsyncIterable[tuple[_K, _S]]
-        ] = Nothing,
+        mapping: Maybe[Union[
+            Mapping[_K, StateVar[_S]],
+            AsyncIterable[tuple[_K, _S]],
+            AsyncIterable[tuple[_K, StateVar[_S]]],
+        ]] = Nothing,
         /,
         **states: StateVar[_S],
     ):
@@ -424,20 +428,7 @@ class StateDict(
         if self._producer is not Nothing:
             raise StateError(f'{self!r} is readonly')
 
-        if isinstance(value, StateVar):
-            if key in self._states:
-                state = self._states[key]
-
-                if state.is_set:
-                    raise KeyError(f'{key!r} already set: {state}')
-
-                state.set_from(value)
-
-            else:
-                self._states[key] = value
-                value._collections.append((key, self))
-        else:
-            self[key].set(value)
+        self._set_item((key, value))
 
     def __delitem__(self, key: _K) -> None:
         if self._producer is not Nothing:
@@ -515,9 +506,23 @@ class StateDict(
         # noinspection PyProtectedMember
         return {k: s._get(default) for k, s in self._states.items()}
 
-    def _set_item(self, item: tuple[_K, _S]):
+    def _set_item(self, item: tuple[_K, StateVar[_S] | _S]):
         key, value = item
-        self[key]._set(value)
+
+        if isinstance(value, StateVar):
+            if key in self._states:
+                state = self._states[key]
+
+                if state.is_set:
+                    raise KeyError(f'{key!r} already set: {state}')
+
+                state.set_from(value)
+
+            else:
+                self._states[key] = value
+                value._collections.append((key, self))
+        else:
+            self[key].set(value)
 
     def _on_stop(self):
         super()._on_stop()
