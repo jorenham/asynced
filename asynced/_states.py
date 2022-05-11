@@ -4,22 +4,23 @@ __all__ = ('StateBase', 'State', 'StateCollection')
 
 import abc
 import asyncio
-import inspect
 import itertools
 from typing import (
-    AsyncIterable,
-    cast, Mapping, overload,
     Any,
+    AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
+    cast,
     Collection,
     Coroutine,
     Final,
     Generator,
     Generic,
     Literal,
+    Mapping,
     NoReturn,
+    overload,
     TypeVar,
     Union,
 )
@@ -28,7 +29,7 @@ from typing_extensions import ParamSpec, Self, TypeAlias
 
 from . import amap_iter
 from ._typing import awaitable, Comparable, Maybe, Nothing, NothingType
-from .exceptions import StopAnyIteration, StateError
+from .exceptions import StateError, StopAnyIteration
 
 _T = TypeVar('_T')
 _KT = TypeVar('_KT')
@@ -178,7 +179,7 @@ class StateBase(Generic[_S]):
         self._future.cancel()
         self._on_cancel()
 
-    def _on_set(self, value: Maybe[object] = Nothing) -> None:
+    def _on_set(self, value: object) -> None:
         ...
 
     def _on_error(self, exc: BaseException) -> None:
@@ -237,7 +238,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
     _collections: list[tuple[Any, StateCollection[Any, _S, Any]]]
 
     # see _set_from(), can be set only once
-    _producer: Maybe[AsyncIterable[_S]]
+    _producer: Maybe[AsyncIterable[Any]]
     _consumer: Maybe[asyncio.Task[None | NoReturn]]
 
     def __init__(
@@ -422,7 +423,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         assert self._producer is not Nothing
         try:
             async for state in self._producer:
-                self._set(state)
+                self._set_item(state)
         except (SystemExit, KeyboardInterrupt) as exc:
             self._raise(exc)
             raise
@@ -477,7 +478,11 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
         return notified
 
-    def _set_from(self, producer: AsyncIterable[_S]) -> None:
+    def _set_item(self, value: Any):
+        """Used by the consumer to set the next item"""
+        self._set(cast(_S, value))
+
+    def _set_from(self, producer: AsyncIterable[Any]) -> None:
         if self._producer is not Nothing:
             raise StateError(f'{self!r} is already being set')
 
@@ -542,7 +547,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
         return key is key_current or key == key_current
 
-    def _on_set(self, value: Maybe[object] = Nothing) -> None:
+    def _on_set(self, value: object) -> None:
         self._is_set = True
 
     def _on_stop(self) -> None:
@@ -620,7 +625,9 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
 
     @property
     def readonly(self) -> bool:
-        return any(s.readonly for s in self._get_states().values())
+        return super().readonly or any(
+            s.readonly for s in self._get_states().values()
+        )
 
     @property
     def any_done(self) -> bool:
@@ -677,8 +684,10 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
 
         return states[key]._get(default)
 
+    # Internal: following methods are called by a statevar after it was updated
+
     # noinspection PyUnusedLocal
-    def _on_item_set(self, item: _KT, value: Maybe[_S] = Nothing) -> None:
+    def _on_item_set(self, item: _KT, value: _S) -> None:
         if self.all_set:
             self._set(self._get_data())
 

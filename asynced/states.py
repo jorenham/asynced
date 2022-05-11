@@ -8,14 +8,12 @@ __all__ = (
 )
 
 
-import asyncio
 import functools
 import itertools
 
 from typing import (
     Any,
     AsyncIterable,
-    AsyncIterator,
     Awaitable,
     Callable,
     cast,
@@ -38,7 +36,6 @@ from typing_extensions import TypeAlias
 from . import StateError
 from ._states import State, StateCollection
 from ._typing import Comparable, Maybe, Nothing, NothingType
-from .asyncio_utils import race
 
 
 _T = TypeVar('_T', bound=object)
@@ -129,7 +126,7 @@ class StateVar(State[_S], Generic[_S]):
     def _get_task_name(self) -> str:
         return self._name
 
-    def _on_set(self, state: Maybe[_S] = Nothing) -> None:
+    def _on_set(self, state: _S) -> None:
         super()._on_set(state)
 
         for j, parent in self._collections:
@@ -309,18 +306,6 @@ class StateTuple(
     ) -> State[_RS]:
         return self.map(lambda ss: function(*ss), cls, *cls_args, **cls_kwargs)
 
-    # PyCharm doesn't understand walrus precedence:
-    # noinspection PyRedundantParentheses
-    async def _get_producer(self) -> AsyncIterator[tuple[_S]]:
-        try:
-            yield (states := tuple(await asyncio.gather(*self._states)))
-
-            async for i, state in race(*self._states):
-                yield (states := states[:i] + (state, ) + states[i+1:])
-
-        except StopAsyncIteration:
-            pass
-
     def _get_states(self) -> Mapping[int, State[_S]]:
         return {i: s for i, s in enumerate(self._states)}
 
@@ -339,9 +324,10 @@ class StateDict(
     Mapping[_K, StateVar[_S]],
     Generic[_K, _S],
 ):
-    __slots__ = ('_states',)
+    __slots__ = ('_states', '_state_item_last')
 
     _states: dict[_K, StateVar[_S]]
+    _state_item_last: StateTuple[_K | _S | None]
 
     @overload
     def __init__(self, __arg: NothingType = ..., /): ...
@@ -369,6 +355,7 @@ class StateDict(
                     f'an async iterable is given'
                 )
 
+        producer = Nothing
         if mapping is Nothing:
             initial_states = states
         elif isinstance(mapping, Mapping):
@@ -380,8 +367,8 @@ class StateDict(
                     f'an async iterable is given'
                 )
 
-            # TODO
-            raise NotImplementedError('async iterables not supported yet')
+            initial_states = {}
+            producer = mapping
         else:
             raise TypeError(
                 f'{type(mapping).__name__!r} object is not a mapping or '
@@ -408,6 +395,14 @@ class StateDict(
             state._collections.append((key, self))
 
             self._states[cast(_K, key)] = state
+
+        self._state_item_last = StateTuple(2)
+
+        self._producer = Nothing
+        self._consumer = Nothing
+
+        if producer is not Nothing:
+            self._set_from(producer)
 
     def __bool__(self) -> bool:
         return len(self) > 0
@@ -436,13 +431,13 @@ class StateDict(
                 if state.is_set:
                     raise KeyError(f'{key!r} already set: {state}')
 
-                state._set_from(value)
+                state.set_from(value)
 
             else:
                 self._states[key] = value
                 value._collections.append((key, self))
         else:
-            self[key]._set(value)
+            self[key].set(value)
 
     def __delitem__(self, key: _K) -> None:
         if self._producer is not Nothing:
@@ -467,6 +462,15 @@ class StateDict(
         state._collections.append((key, self))
 
         return state
+
+    @property
+    def head(self) -> StateTuple[_K | _S | None]:
+        """StateVarTuple of (key: _K, value: _S | None) t, with key and value
+        of the item that was most recently updated.
+
+        For deletions `value` is None.
+        """
+        return self._state_item_last
 
     def get(
         self,
@@ -510,6 +514,34 @@ class StateDict(
 
         # noinspection PyProtectedMember
         return {k: s._get(default) for k, s in self._states.items()}
+
+    def _set_item(self, item: tuple[_K, _S]):
+        key, value = item
+        self[key]._set(value)
+
+    def _on_stop(self):
+        super()._on_stop()
+        self._state_item_last._stop()
+
+    def _on_error(self, exc: BaseException):
+        super()._on_error(exc)
+        self._state_item_last._raise(exc)
+
+    def _on_cancel(self) -> None:
+        super()._on_cancel()
+        self._state_item_last._cancel()
+
+    def _on_item_set(self, key: _K, value: _S) -> None:
+        super()._on_item_set(key, value)
+
+        state = self._state_item_last
+        state[0], state[1] = key, value
+
+    def _on_item_del(self, key: _K) -> None:
+        super()._on_item_del(key)
+
+        state = self._state_item_last
+        state[0], state[1] = key, None
 
 
 _SS = TypeVar('_SS', bound=State)

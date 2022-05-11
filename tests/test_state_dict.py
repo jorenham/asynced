@@ -1,3 +1,4 @@
+import asyncio
 from typing import Final
 
 from asynced import StateVar, StateDict
@@ -91,3 +92,43 @@ async def test_set_item():
     assert 'ham' in s
     assert s.get('ham') == 6
     assert await s['ham'] == 6
+
+
+async def test_producer():
+    async def producer():
+        await asyncio.sleep(DT)
+        yield 'spam', 42
+        await asyncio.sleep(DT)
+        yield 'ham', 6
+        await asyncio.sleep(DT)
+        yield 'spam', 69
+
+    s = StateDict(producer())
+    ss = [d async for d in s]
+
+    assert s.is_done
+    assert len(ss) == 4
+
+    assert ss[0] == {}
+    assert ss[1] == {'spam': 42}
+    assert ss[2] == {'spam': 42, 'ham': 6}
+    assert ss[3] == {'spam': 69, 'ham': 6}
+
+    assert await s == {'spam': 69, 'ham': 6}
+
+
+async def test_head():
+    s = StateDict()
+    assert not s.head.is_set
+
+    s[0] = 'a'
+    assert await s.head == (0, 'a')
+
+    s[1] = 'b'
+    assert await s.head == (1, 'b')
+
+    s[0] = 'c'
+    assert await s.head == (0, 'c')
+
+    del s[0]
+    assert await s.head == (0, None)
