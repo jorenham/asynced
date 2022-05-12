@@ -9,7 +9,10 @@ from asynced._typing import acallable, awaitable, ishashclass
 async def test_awaitable():
     assert not awaitable(object())
 
-    assert awaitable(asyncio.sleep(0))
+    aw = asyncio.sleep(0)
+    assert awaitable(aw)
+    await aw  # to avoid a RuntimeWarning
+
     assert awaitable(asyncio.get_running_loop().create_future())
 
     class Spam:

@@ -14,6 +14,7 @@ import itertools
 from typing import (
     Any,
     AsyncIterable,
+    AsyncIterator,
     Awaitable,
     Callable,
     cast,
@@ -24,7 +25,7 @@ from typing import (
     get_type_hints,
     ItemsView,
     Iterable,
-    KeysView,
+    Iterator, KeysView,
     Mapping,
     overload,
     Sequence,
@@ -35,7 +36,7 @@ from typing_extensions import TypeAlias
 
 from . import StateError
 from ._states import State, StateCollection
-from ._typing import Comparable, Maybe, Nothing, NothingType
+from ._typing import Comparable, EllipsisType, Maybe, Nothing, NothingType
 
 
 _T = TypeVar('_T', bound=object)
@@ -324,10 +325,9 @@ class StateDict(
     Mapping[_K, StateVar[_S]],
     Generic[_K, _S],
 ):
-    __slots__ = ('_states', '_state_item_last')
+    __slots__ = ('_states',)
 
     _states: dict[_K, StateVar[_S]]
-    _state_item_last: StateTuple[_K | _S | None]
 
     @overload
     def __init__(self, __arg: NothingType = ..., /): ...
@@ -400,8 +400,6 @@ class StateDict(
 
             self._states[cast(_K, key)] = state
 
-        self._state_item_last = StateTuple(2)
-
         self._producer = Nothing
         self._consumer = Nothing
 
@@ -409,20 +407,24 @@ class StateDict(
             self._set_from(producer)
 
     def __bool__(self) -> bool:
-        return len(self) > 0
+        return self.is_set
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[_K]:
         return iter(self._get_states())
+
+    def __aiter__(self) -> AsyncIterator[dict[_K, _S]]:
+        return super().__aiter__()
 
     def __contains__(self, key: _K) -> bool:
         return key in self._states and self._states[key].is_set
 
     def __getitem__(self, key: _K) -> StateVar[_S]:
         states = self._states
-        if key in states:
-            return states[key]
 
-        return self.__missing__(key)
+        if key not in states:
+            states[key] = self.__missing__(key)
+
+        return states[key]
 
     def __setitem__(self, key: _K, value: StateVar[_S] | _S) -> None:
         if self._producer is not Nothing:
@@ -434,34 +436,77 @@ class StateDict(
         if self._producer is not Nothing:
             raise StateError(f'{self!r} is readonly')
 
-        if key in self._states:
-            state = self._states[key]
-            state._cancel()
-
-            state._collections.remove((key, self))
-            del self._states[key]
-
-            self._on_item_del(key)
-
-        else:
+        if key not in self._states:
             raise KeyError(key)
+
+        self._set_item((key, ...))
 
     def __missing__(self, key: _K) -> StateVar[_S]:
         assert key not in self._states
 
-        state = self._states[key] = StateVar()
+        state = StateVar()
         state._collections.append((key, self))
-
         return state
 
     @property
-    def head(self) -> StateTuple[_K | _S | None]:
-        """StateVarTuple of (key: _K, value: _S | None) t, with key and value
-        of the item that was most recently updated.
+    def is_set(self) -> bool:
+        return len(self) > 0
 
-        For deletions `value` is None.
+    async def additions(self) -> AsyncIterator[tuple[_K, _S]]:
+        """Returns an async iterator that yields tuples of (key, value) items
+        that will be set to a new value."""
+        data_prev = self.get().copy()
+
+        async for data in self:
+            for key_new in data.keys() - data_prev.keys():
+                yield key_new, data[key_new]
+
+            data_prev = data
+
+    async def deletions(self) -> AsyncIterator[tuple[_K, _S]]:
+        """Returns an async iterator that yields tuples of (key, value) items
+        that will be deleted.
         """
-        return self._state_item_last
+        data_prev = self.get().copy()
+
+        async for data in self:
+            for key_old in data_prev.keys() - data.keys():
+                yield key_old, data_prev[key_old]
+
+            data_prev = data
+
+    async def changes(self) -> AsyncIterator[tuple[_K, _S, _S]]:
+        """Returns an async iterator that yields tuples of
+        (key, value_old, value_new).
+        """
+        data_prev: dict[_K, _S] = self.get().copy()
+
+        async for data in self:
+            keys_intersection = cast(set[_K], data_prev.keys() & data.keys())
+            for key in keys_intersection:
+                key_fn = self[key]._key
+
+                value_prev, value = key_fn(data_prev[key]), key_fn(data[key])
+                if value_prev is not value and value_prev != value:
+                    yield key, data_prev[key], data[key]
+
+            data_prev = data
+
+    def keys(self) -> KeysView[_K]:
+        return self._get_states().keys()
+
+    def values(self) -> ValuesView[StateVar[_S]]:
+        return self._get_states().values()
+
+    def items(self) -> ItemsView[_K, StateVar[_S]]:
+        return self._get_states().items()
+
+    @overload
+    def get(self) -> dict[_K, _S]: ...
+    @overload
+    def get(self, key: _K) -> _S: ...
+    @overload
+    def get(self, key: _K, default: _T = ...) -> _S | _T: ...
 
     def get(
         self,
@@ -475,15 +520,6 @@ class StateDict(
             return self._get_data()
 
         return super().get(key, default=default)
-
-    def keys(self, is_set: bool = True) -> KeysView[_K]:
-        return self._get_states(is_set).keys()
-
-    def values(self, is_set: bool = True) -> ValuesView[StateVar[_S]]:
-        return self._get_states(is_set).values()
-
-    def items(self, is_set: bool = True) -> ItemsView[_K, StateVar[_S]]:
-        return self._get_states(is_set).items()
 
     def clear(self) -> None:
         states = self._states
@@ -506,10 +542,24 @@ class StateDict(
         # noinspection PyProtectedMember
         return {k: s._get(default) for k, s in self._states.items()}
 
-    def _set_item(self, item: tuple[_K, StateVar[_S] | _S]):
+    def _set_item(self, item: tuple[_K, EllipsisType | StateVar[_S] | _S]):
+        if len(item) != 2:
+            raise TypeError(
+                f'{type(self).__name__} async iterable must yield tuples of '
+                f'length 2, got {repr(item)}'
+            )
+
         key, value = item
 
-        if isinstance(value, StateVar):
+        if value is Ellipsis:
+            state = self._states[key]
+            state._collections.remove((key, self))
+
+            del self._states[key]
+
+            self._on_item_del(key)
+
+        elif isinstance(value, StateVar):
             if key in self._states:
                 state = self._states[key]
 
@@ -522,31 +572,7 @@ class StateDict(
                 self._states[key] = value
                 value._collections.append((key, self))
         else:
-            self[key].set(value)
-
-    def _on_stop(self):
-        super()._on_stop()
-        self._state_item_last._stop()
-
-    def _on_error(self, exc: BaseException):
-        super()._on_error(exc)
-        self._state_item_last._raise(exc)
-
-    def _on_cancel(self) -> None:
-        super()._on_cancel()
-        self._state_item_last._cancel()
-
-    def _on_item_set(self, key: _K, value: _S) -> None:
-        super()._on_item_set(key, value)
-
-        state = self._state_item_last
-        state[0], state[1] = key, value
-
-    def _on_item_del(self, key: _K) -> None:
-        super()._on_item_del(key)
-
-        state = self._state_item_last
-        state[0], state[1] = key, None
+            self[key].set(cast(_S, value))
 
 
 _SS = TypeVar('_SS', bound=State)

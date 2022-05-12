@@ -7,12 +7,30 @@ from asynced import StateVar, StateDict
 DT: Final[float] = 0.01
 
 
+async def _producer1():
+    items = ('spam', 42), ('ham', 6), ('spam', 69)
+    for item in items:
+        yield await asyncio.sleep(DT, item)
+
+
+async def _producer2():
+    items = [
+        ('spam', 42),
+        ('ham', 6),
+        ('spam', ...),
+        ('spam', 69),
+        ('ham', ...),
+        ('spam', 666),
+    ]
+    for item in items:
+        yield await asyncio.sleep(DT, item)
+
+
 async def test_initial():
     s: StateDict[str, str] = StateDict()
 
     assert not s
-
-    assert await s == {}
+    assert not s.is_set
     assert s.get() == {}
 
     assert len(s) == 0
@@ -55,10 +73,10 @@ async def test_initial_kwarg_set():
     sv: StateVar[int] = StateVar()
     s: StateDict[str, int] = StateDict(spam=sv)
 
-    assert await s == {}
-    assert s.get() == {}
+    assert not s.is_set
     assert len(s) == 0
     assert len(list(s)) == 0
+    assert s.get() == {}
 
     assert 'spam' not in s
     assert s['spam'] is sv
@@ -95,40 +113,50 @@ async def test_set_item():
 
 
 async def test_producer():
-    async def producer():
-        await asyncio.sleep(DT)
-        yield 'spam', 42
-        await asyncio.sleep(DT)
-        yield 'ham', 6
-        await asyncio.sleep(DT)
-        yield 'spam', 69
-
-    s = StateDict(producer())
+    s = StateDict(_producer1())
     ss = [d async for d in s]
 
     assert s.is_done
-    assert len(ss) == 4
+    assert len(ss) == 3
 
-    assert ss[0] == {}
-    assert ss[1] == {'spam': 42}
-    assert ss[2] == {'spam': 42, 'ham': 6}
-    assert ss[3] == {'spam': 69, 'ham': 6}
+    assert ss[0] == {'spam': 42}
+    assert ss[1] == {'spam': 42, 'ham': 6}
+    assert ss[2] == {'spam': 69, 'ham': 6}
 
     assert await s == {'spam': 69, 'ham': 6}
 
 
-async def test_head():
-    s = StateDict()
-    assert not s.head.is_set
+async def test_additions():
+    s = StateDict(_producer1())
+    a = [i async for i in s.additions()]
 
-    s[0] = 'a'
-    assert await s.head == (0, 'a')
+    assert s.is_done
+    assert len(a) == 2
 
-    s[1] = 'b'
-    assert await s.head == (1, 'b')
+    assert a[0] == ('spam', 42)
+    assert a[1] == ('ham', 6)
 
-    s[0] = 'c'
-    assert await s.head == (0, 'c')
 
-    del s[0]
-    assert await s.head == (0, None)
+async def test_deletions():
+    s = StateDict(_producer2())
+    a = [i async for i in s.deletions()]
+
+    assert s.is_done
+    assert len(s) == 1
+    assert s.get() == {'spam': 666}
+
+    assert len(a) == 2
+    assert a[0] == ('spam', 42)
+    assert a[1] == ('ham', 6)
+
+
+async def test_changes():
+    s = StateDict(_producer2())
+    a = [i async for i in s.changes()]
+
+    assert s.is_done
+    assert len(s) == 1
+    assert s.get() == {'spam': 666}
+
+    assert len(a) == 1
+    assert a[0] == ('spam', 69, 666)

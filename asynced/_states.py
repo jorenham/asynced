@@ -272,12 +272,18 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
         self._collections.clear()
 
-    def __eq__(self, other: State[_S] | _S) -> bool:
+    def __eq__(self, other: _S) -> bool:
         if not self.is_set:
             return False
 
         value = self._get()
         return bool(value is other or value == other)
+
+    def __await__(self) -> Generator[Any, None, _S]:
+        if not self.is_set:
+            return self.__anext__().__await__()
+
+        return super().__await__()
 
     async def __aiter__(self) -> AsyncIterator[_S]:
         queue = collections.deque()
@@ -321,7 +327,6 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         finally:
             if waiter_id in waiters:
                 del waiters[waiter_id]
-
 
     async def __anext__(self) -> _S:
         self._check_next()
@@ -478,10 +483,9 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         if not always and self._equals(value):
             return 0
 
-        future = self.__get_fresh_future().set_result(value)
+        self.__get_fresh_future().set_result(value)
 
         self._on_set(value)
-
         self.__notify_waiters(value)
 
     def _set_item(self, value: Any):
@@ -537,7 +541,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             # can occur when the event got closed
             pass
 
-        self.__notify_waiters(None, None, True)
+        self.__notify_waiters(None, cancel=True)
 
     def _equals(self, state: _S) -> bool:
         """Returns True if set and the argument is equal to the current state"""
@@ -597,7 +601,8 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         # self.__waiters = {}
 
         for waiter in waiters.values():
-            assert not waiter.done()
+            if waiter.done():
+                continue
 
             if cancel:
                 waiter.cancel()
