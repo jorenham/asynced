@@ -4,6 +4,7 @@ __all__ = ('StateBase', 'State', 'StateCollection')
 
 import abc
 import asyncio
+import collections
 import itertools
 from typing import (
     Any,
@@ -211,14 +212,9 @@ class StateBase(Generic[_S]):
 
 class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
     __slots__ = (
-        '__propositions__',
-
         '_key',
 
-        '_waiters',
         '_collections',
-        '__waiter_counter',
-
         '_producer',
         '_consumer',
 
@@ -226,13 +222,13 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         '_is_stopped',
         '_is_error',
         '_is_cancelled',
+
+        '__waiters',
+        '__waiter_counter',
     )
 
     # when provided, states are mapped before they're compared
     _key: Callable[[_S], Comparable]
-
-    # future for each waiter in __await__
-    _waiters: dict[int, asyncio.Future[_S]]
 
     # change notification to e.g. StateVarTuple
     _collections: list[tuple[Any, StateCollection[Any, _S, Any]]]
@@ -248,11 +244,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
     ) -> None:
         super().__init__()
 
-        self.__propositions__ = {}
         self._key = key
-
-        self._waiters = {}
-        self.__waiter_counter = itertools.count(0).__next__
 
         self._consumer = Nothing
         self._producer = Nothing
@@ -265,16 +257,19 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         self._is_error = False
         self._is_cancelled = False
 
+        self.__waiters = {}
+        self.__waiter_counter = itertools.count(0).__next__
+
     def __del__(self):
         super().__del__()
 
         try:
-            for waiter in self._waiters.values():
+            self._future.cancel()
+            for waiter in self.__waiters.values():
                 waiter.cancel()
         except RuntimeError:
             pass
 
-        self.__propositions__.clear()
         self._collections.clear()
 
     def __eq__(self, other: State[_S] | _S) -> bool:
@@ -284,47 +279,64 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         value = self._get()
         return bool(value is other or value == other)
 
-    def __aiter__(self) -> AsyncIterator[_S]:
-        async def _aiter():
-            present = self._future
-            loop = present.get_loop()
+    async def __aiter__(self) -> AsyncIterator[_S]:
+        queue = collections.deque()
+        if self.is_set:
+            queue.append(self._future)
+
+        waiters = self.__waiters
+        waiter_id = self.__waiter_counter()
+
+        def _schedule_next(present=None):
+            if present:
+                if present.cancelled():
+                    return
+                if isinstance(present.exception(), StopAsyncIteration):
+                    return
+
+                loop = present.get_loop()
+            else:
+                loop = asyncio.get_running_loop()
+
+            future = loop.create_future()
+            future.add_done_callback(_schedule_next)
+
+            assert waiter_id not in waiters or waiters[waiter_id].done()
+            waiters[waiter_id] = future
+
+            queue.append(future)
+
+        try:
+            _schedule_next()
 
             while not self.is_done:
-                waiter_id = self.__waiter_counter()
-                future: asyncio.Future[_S] = loop.create_future()
-                self._waiters[waiter_id] = future
-
-                if present is not None and present.done():
-                    try:
-                        yield present.result()
-                    except StopAsyncIteration:
-                        del self._waiters[waiter_id]
-                        break
-
-                present = None
+                if not len(queue):
+                    await asyncio.sleep(0)
+                    assert len(queue)
 
                 try:
-                    yield await future
-                except StopAsyncIteration:
+                    yield await queue.popleft()
+                except StopAnyIteration:
                     break
-                finally:
-                    del self._waiters[waiter_id]
+        finally:
+            if waiter_id in waiters:
+                del waiters[waiter_id]
 
-        return _aiter()
 
     async def __anext__(self) -> _S:
         self._check_next()
 
+        waiters = self.__waiters
         waiter_id = self.__waiter_counter()
-        future = asyncio.get_running_loop().create_future()
-        self._waiters[waiter_id] = future
+
+        future = waiters[waiter_id] = self._future.get_loop().create_future()
 
         try:
             return await future
         except asyncio.CancelledError as exc:
             raise StopAsyncIteration from exc
         finally:
-            del self._waiters[waiter_id]
+            del waiters[waiter_id]
 
     __hash__ = None  # type: ignore
 
@@ -462,21 +474,15 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             raise LookupError(repr(self))
         return default
 
-    def _set(self, value: _S, always: bool = False) -> int:
+    def _set(self, value: _S, always: bool = False):
         if not always and self._equals(value):
             return 0
 
-        self.__get_fresh_future().set_result(value)
+        future = self.__get_fresh_future().set_result(value)
+
         self._on_set(value)
 
-        notified = 1  # consider self as waiter
-
-        for waiter in self._waiters.values():
-            if not waiter.done():
-                waiter.set_result(value)
-                notified += 1
-
-        return notified
+        self.__notify_waiters(value)
 
     def _set_item(self, value: Any):
         """Used by the consumer to set the next item"""
@@ -499,31 +505,31 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         return state
 
     def _stop(self) -> None:
+        exc = StopAsyncIteration
+
         future = self._future
         if not future.done():
-            future.set_exception(StopAsyncIteration)
+            future.set_exception(exc)
 
         self._on_stop()
 
-        for waiter in self._waiters.values():
-            if not waiter.done():
-                waiter.set_exception(StopAsyncIteration)
+        self.__notify_waiters(None, exc)
 
     def _raise(self, exc: BaseException) -> None:
         if isinstance(exc, asyncio.CancelledError):
             self._cancel()
             return
 
-        self.__get_fresh_future().set_exception(exc)
+        future = self.__get_fresh_future()
+        future.set_exception(exc)
 
         self._on_error(exc)
 
-        for waiter in self._waiters.values():
-            if not waiter.done():
-                waiter.set_exception(exc)
+        self.__notify_waiters(None, exc)
 
     def _cancel(self) -> None:
-        self._future.cancel()
+        future = self._future
+        future.cancel()
 
         try:
             self._on_cancel()
@@ -531,9 +537,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             # can occur when the event got closed
             pass
 
-        for waiter in self._waiters.values():
-            if not waiter.done():
-                waiter.cancel()
+        self.__notify_waiters(None, None, True)
 
     def _equals(self, state: _S) -> bool:
         """Returns True if set and the argument is equal to the current state"""
@@ -585,6 +589,22 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         self._check()
         if self.is_done:
             raise StopAsyncIteration
+
+    def __notify_waiters(self, result, exc=None, cancel=False):
+        waiters = self.__waiters
+
+        # waiters = self.__waiters.copy()
+        # self.__waiters = {}
+
+        for waiter in waiters.values():
+            assert not waiter.done()
+
+            if cancel:
+                waiter.cancel()
+            elif exc is not None:
+                waiter.set_exception(exc)
+            else:
+                waiter.set_result(result)
 
     def __get_fresh_future(self) -> asyncio.Future[_S]:
         future = self._future
