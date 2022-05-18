@@ -285,10 +285,10 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
         return super().__await__()
 
-    async def __aiter__(self) -> AsyncIterator[_S]:
-        queue = collections.deque()
+    async def __aiter__(self, *, buffer: int | None = 4) -> AsyncIterator[_S]:
+        buffer = collections.deque(maxlen=buffer)
         if self.is_set:
-            queue.append(self._future)
+            buffer.append(self._future)
 
         waiters = self.__waiters
         waiter_id = self.__waiter_counter()
@@ -310,18 +310,18 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             assert waiter_id not in waiters or waiters[waiter_id].done()
             waiters[waiter_id] = future
 
-            queue.append(future)
+            buffer.append(future)
 
         try:
             _schedule_next()
 
             while not self.is_done:
-                if not len(queue):
+                if not len(buffer):
                     await asyncio.sleep(0)
-                    assert len(queue)
+                    assert len(buffer)
 
                 try:
-                    yield await queue.popleft()
+                    yield await buffer.popleft()
                 except StopAnyIteration:
                     break
         finally:
