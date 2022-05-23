@@ -140,6 +140,7 @@ async def test_set_multi():
 
     s[2] = 'eggs'
 
+    await s
     assert bool(s.any_set)
     assert bool(s.is_set)
 
@@ -153,6 +154,7 @@ async def test_set_together():
     assert s[0] is s[1]
 
     s[0] = 'spam'
+    await s
     assert s.is_set
     assert s.get(0) == 'spam'
     assert s.get(1) == 'spam'
@@ -354,14 +356,15 @@ async def test_producers_interleaved_error():
     assert s[0].is_done
     assert s[1].is_done
 
-    assert s[0].is_error
+    assert not s[0].is_error
     assert s[1].is_error
 
     assert s.any_error
     assert s.is_error
 
-    assert not s[0].is_stopped
+    assert s[0].is_stopped
     assert not s[1].is_stopped
 
-    assert not s.any_stopped
-    assert not s.is_stopped
+    assert s.any_stopped
+    assert not s.all_stopped
+    assert s.is_stopped

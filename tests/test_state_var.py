@@ -24,6 +24,7 @@ async def slowrange(dt, *args):
 async def state_enumerate(statevar: StateVar):
     i = 0
     async for v in statevar:
+        print('ASDASD', i, v)
         yield i, v
         i += 1
 

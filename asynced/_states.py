@@ -54,12 +54,14 @@ _ST = TypeVar('_ST', bound='State')
 
 
 class StateBase(Generic[_S]):
-    __slots__ = ('__future', )
+    __slots__ = ('__loop', '__future', )
     __match_args__ = ('_value_raw',)
 
+    __loop: asyncio.AbstractEventLoop | None
     __future: asyncio.Future[_S] | None
 
     def __init__(self):
+        self.__loop = None
         self.__future = None
 
     def __del__(self):
@@ -122,22 +124,47 @@ class StateBase(Generic[_S]):
         return isinstance(future.exception(), asyncio.CancelledError)
     
     @property
+    def _loop(self) -> asyncio.AbstractEventLoop:
+        if (loop := self.__loop) is None:
+            if (future := self.__future) is not None:
+                loop = future.get_loop()
+            else:
+                loop = asyncio.get_running_loop()
+
+            self.__loop = loop
+
+        return loop
+
+    @property
     def _future(self) -> asyncio.Future[_S]:
         if (future := self.__future) is None:
-            future = self.__future = asyncio.get_running_loop().create_future()
+            future = self.__future = self._loop.create_future()
 
         return future
 
     @_future.setter
-    def _future(self, future: asyncio.Future[_S]):
-        if hasattr(self, '__future'):
-            raise AttributeError(f"'_future' is already set")
-        
+    def _future(self, value: asyncio.Future[_S] | _S):
+        if done := (future := self._future).done():
+            future.result()
+
+        if asyncio.isfuture(value):
+            future = value
+        else:
+            if done:
+                future = future.get_loop().create_future()
+            future.set_result(value)
+
         self.__future = future
 
-    @property
-    def _loop(self) -> asyncio.AbstractEventLoop:
-        return self._future.get_loop()
+    @_future.deleter
+    def _future(self):
+        if (future := self.__future) is None or not future.done():
+            return
+
+        if future.cancelled():
+            future.result()  # will raise asyncio.CancelledError
+
+        self.__future = future.get_loop().create_future()
 
     @property
     def _value_raw(self) -> _S | BaseException | None:
@@ -147,26 +174,14 @@ class StateBase(Generic[_S]):
             return None
         try:
             return fut.result()
+        except (SystemExit, KeyboardInterrupt):
+            raise
         except BaseException as exc:
             return exc
     
     def _set(self, value: _S) -> None:
         self.__as_unset_future().set_result(value)
         self._on_set(value)
-
-    def _clear(self) -> None:
-        """recreates the future if exists and set"""
-        try:
-            future = self.__future
-        except AttributeError:
-            return
-
-        if future is None or not future.done():
-            return
-
-        future.result()  # in case of exceptions raises 'em
-
-        self.__future = future.get_loop().create_future()
 
     def _raise(self, exc: BaseException) -> None:
         if isinstance(exc, asyncio.CancelledError):
@@ -176,11 +191,14 @@ class StateBase(Generic[_S]):
         self.__as_unset_future().set_exception(exc)
         self._on_error(exc)
 
-    def _cancel(self) -> None:
-        self._future.cancel()
+    def _cancel(self) -> bool:
+        cancelled = self._future.cancel()
+
         self._on_cancel()
 
-    def _on_set(self, value: object) -> None:
+        return cancelled
+
+    def _on_set(self, value: _S) -> None:
         ...
 
     def _on_error(self, exc: BaseException) -> None:
@@ -334,7 +352,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         waiters = self.__waiters
         waiter_id = self.__waiter_counter()
 
-        future = waiters[waiter_id] = self._future.get_loop().create_future()
+        future = waiters[waiter_id] = self._loop.create_future()
 
         try:
             return await future
@@ -459,6 +477,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         except BaseException as exc:
             self._raise(exc)
         else:
+            await asyncio.sleep(0)
             self._stop()
 
     @overload
@@ -479,19 +498,6 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             raise LookupError(repr(self))
         return default
 
-    def _set(self, value: _S, always: bool = False):
-        if not always and self._equals(value):
-            return 0
-
-        self.__get_fresh_future().set_result(value)
-
-        self._on_set(value)
-        self.__notify_waiters(value)
-
-    def _set_item(self, value: Any):
-        """Used by the consumer to set the next item"""
-        self._set(cast(_S, value))
-
     def _set_from(self, producer: AsyncIterable[Any]) -> None:
         if self._producer is not Nothing:
             raise StateError(f'{self!r} is already being set')
@@ -501,12 +507,24 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         task_name = f'{self}.consumer'
         self._consumer = asyncio.create_task(self._consume(), name=task_name)
 
-    def _set_apply(self, function: Callable[[_S], _S]) -> _S:
-        """Apply the function to the current state value and return it."""
-        # TODO support async functions
-        state = function(self._get())
-        self._set(state)
-        return state
+    def _set_item(self, value: Any):
+        """Used by the consumer to set the next item"""
+        self._set(cast(_S, value))
+
+    def _set(self, value: _S, always: bool = False):
+        if not always and self._equals(value):
+            return 0
+
+        del self._future
+        self._future.set_result(value)
+
+        self._on_set(value)
+        self.__notify_waiters(value)
+
+    def _clear(self) -> None:
+        del self._future
+
+        self._on_clear()
 
     def _stop(self) -> None:
         exc = StopAsyncIteration
@@ -516,32 +534,77 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             future.set_exception(exc)
 
         self._on_stop()
+        self.__notify_waiters(exc=exc)
 
-        self.__notify_waiters(None, exc)
+    def _raise(self, exc: type[BaseException] | BaseException) -> None:
+        if isinstance(exc, type):
+            exc = exc()
 
-    def _raise(self, exc: BaseException) -> None:
         if isinstance(exc, asyncio.CancelledError):
             self._cancel()
-            return
+        elif isinstance(exc, StopAsyncIteration):
+            self._stop()
+        else:
+            del self._future
+            self._future.set_exception(exc)
 
-        future = self.__get_fresh_future()
-        future.set_exception(exc)
+            self._on_error(exc)
+            self.__notify_waiters(exc=exc)
 
-        self._on_error(exc)
+    def _cancel(self) -> bool:
+        if self._is_cancelled:
+            return False
 
-        self.__notify_waiters(None, exc)
+        self._future.cancel()
 
-    def _cancel(self) -> None:
-        future = self._future
-        future.cancel()
+        self._on_cancel()
+        self.__notify_waiters(cancel=True)
 
-        try:
+    def _on_set(self, state: _S) -> None:
+        self._is_set = True
+
+        for j, parent in self._collections:
+            # noinspection PyProtectedMember
+            parent._on_item_set(j, state)
+
+    def _on_clear(self) -> None:
+        assert not self._is_cancelled
+
+        self._is_set = False
+        self._is_error = False
+        self._is_stopped = False
+
+        for j, parent in self._collections:
+            # noinspection PyProtectedMember
+            parent._on_item_del(j)
+
+    def _on_stop(self) -> None:
+        self._is_stopped = True
+
+        for j, parent in self._collections:
+            # noinspection PyProtectedMember
+            parent._on_item_stop(j)
+
+    def _on_error(self, exc: BaseException) -> None:
+        if isinstance(exc, asyncio.CancelledError):
             self._on_cancel()
-        except RuntimeError:
-            # can occur when the event got closed
-            pass
+        elif isinstance(exc, StopAnyIteration):
+            self._on_stop()
+        else:
+            self._is_error = True
 
-        self.__notify_waiters(None, cancel=True)
+            for j, parent in self._collections:
+                # noinspection PyProtectedMember
+                parent._on_item_error(j, exc)
+
+    def _on_cancel(self) -> None:
+        self._is_cancelled = True
+
+        for j, parent in self._collections:
+            # noinspection PyProtectedMember
+            parent._on_item_cancel(j)
+
+        self._collections.clear()
 
     def _equals(self, state: _S) -> bool:
         """Returns True if set and the argument is equal to the current state"""
@@ -554,22 +617,6 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         key_current = self._key(future.result())
 
         return key is key_current or key == key_current
-
-    def _on_set(self, value: object) -> None:
-        self._is_set = True
-
-    def _on_stop(self) -> None:
-        self._is_stopped = True
-
-    def _on_error(self, exc: BaseException) -> None:
-        if isinstance(exc, StopAnyIteration):
-            self._on_stop()
-            return
-
-        self._is_error = True
-
-    def _on_cancel(self) -> None:
-        self._is_cancelled = True
 
     def _check(self) -> None | NoReturn:
         future = self._future
@@ -594,13 +641,12 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         if self.is_done:
             raise StopAsyncIteration
 
-    def __notify_waiters(self, result, exc=None, cancel=False):
-        waiters = self.__waiters
+    def _ensure_mutable(self) -> None | NoReturn:
+        if self.readonly:
+            raise StateError(f'{self!r} is readonly')
 
-        # waiters = self.__waiters.copy()
-        # self.__waiters = {}
-
-        for waiter in waiters.values():
+    def __notify_waiters(self, result=None, exc=None, cancel=False,):
+        for waiter in self.__waiters.values():
             if waiter.done():
                 continue
 
@@ -612,15 +658,11 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
                 waiter.set_result(result)
 
     def __get_fresh_future(self) -> asyncio.Future[_S]:
-        future = self._future
-        if future.done():
-            future = self._future = future.get_loop().create_future()
-        return future
+        del self._future
+        return self._future
 
 
 class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
-    __slots__ = ()
-
     @abc.abstractmethod
     def __iter__(self): ...
 
@@ -695,11 +737,18 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
         return all(s.is_cancelled for s in self._get_states().values())
 
     @overload
-    def get(self, key: _KT) -> _S: ...
+    def get(self) -> _SS: ...
     @overload
-    def get(self, key: _KT, default: _T = ...) -> _S | _T: ...
+    def get(self, key: _KT, /) -> _S: ...
+    @overload
+    def get(self, key: _KT, /, default: _T = ...) -> _S | _T: ...
 
-    def get(self, key: _KT, default: Maybe[_T] = Nothing) -> _S | _T:
+    def get(
+        self,
+        key: Maybe[_KT] = Nothing,
+        /,
+        default: Maybe[_T] = Nothing
+    ) -> _SS | _S | _T:
         states = self._get_states()
         if key not in states:
             if default is Nothing:
@@ -711,19 +760,22 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
 
     # Internal: following methods are called by a statevar after it was updated
 
+    def _sync_soon(self):
+        self._loop.call_soon(lambda: self._set(self._get_data()))
+
     # noinspection PyUnusedLocal
     def _on_item_set(self, item: _KT, value: _S) -> None:
         if self.all_set:
-            self._set(self._get_data())
+            self._sync_soon()
 
     # noinspection PyUnusedLocal
     def _on_item_del(self, item: _KT) -> None:
         if self.all_set:
-            self._set(self._get_data())
+            self._sync_soon()
 
     # noinspection PyUnusedLocal
     def _on_item_stop(self, item: _KT) -> None:
-        self._stop()
+        self._loop.call_soon(self._stop)
 
     def _on_item_error(self, item: _KT, exc: BaseException) -> None:
         if isinstance(exc, (StopIteration, StopAsyncIteration, GeneratorExit)):
@@ -733,8 +785,12 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
             self._on_item_cancel(item)
             return
 
-        self._raise(exc)
+        self._loop.call_soon(self._raise, exc)
 
     # noinspection PyUnusedLocal
     def _on_item_cancel(self, item: _KT) -> None:
-        self._cancel()
+        loop = self._loop
+        if loop.is_closed():
+            self._cancel()
+        else:
+            loop.call_soon(self._cancel)

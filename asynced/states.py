@@ -25,18 +25,19 @@ from typing import (
     get_type_hints,
     ItemsView,
     Iterable,
-    Iterator, KeysView,
+    Iterator,
+    KeysView,
     Mapping,
     overload,
     Sequence,
     TypeVar,
-    Union, ValuesView,
+    Union,
+    ValuesView,
 )
 from typing_extensions import TypeAlias
 
-from . import StateError
 from ._states import State, StateCollection
-from ._typing import Comparable, EllipsisType, Maybe, Nothing, NothingType
+from ._typing import Comparable, Maybe, Nothing, NothingType
 
 
 _T = TypeVar('_T', bound=object)
@@ -103,6 +104,7 @@ class StateVar(State[_S], Generic[_S]):
 
         Raises StateError if readonly.
         """
+        self._ensure_mutable()
         self._check_next()
 
         if not (skip := self._equals(state)):
@@ -110,12 +112,13 @@ class StateVar(State[_S], Generic[_S]):
 
         return not skip
 
-    def set_from(self, state_producer: AsyncIterable[_S]):
+    def set_from(self, state_producer: State[_S] | AsyncIterable[_S]) -> None:
+        self._ensure_mutable()
+
         self._check()
         self._set_from(state_producer)
 
     def split(self: StateVar[Sequence[_RS]]) -> StateTuple[_RS]:
-        # TODO docstring
         n = len(self.get())
 
         async def producer(i: int):
@@ -126,34 +129,6 @@ class StateVar(State[_S], Generic[_S]):
 
     def _get_task_name(self) -> str:
         return self._name
-
-    def _on_set(self, state: _S) -> None:
-        super()._on_set(state)
-
-        for j, parent in self._collections:
-            # noinspection PyProtectedMember
-            parent._on_item_set(j, state)
-
-    def _on_stop(self) -> None:
-        super()._on_stop()
-
-        for j, parent in self._collections:
-            # noinspection PyProtectedMember
-            parent._on_item_stop(j)
-
-    def _on_error(self, exc: BaseException) -> None:
-        super()._on_error(exc)
-
-        for j, parent in self._collections:
-            # noinspection PyProtectedMember
-            parent._on_item_error(j, exc)
-
-    def _on_cancel(self) -> None:
-        super()._on_cancel()
-
-        for j, parent in self._collections:
-            # noinspection PyProtectedMember
-            parent._on_item_cancel(j)
 
 
 class StateTuple(
@@ -167,18 +142,24 @@ class StateTuple(
 
     def __init__(
         self,
-        producers: int | Iterable[AsyncIterable[_S]] | AsyncIterable[_S],
+        iterable: Union[
+            int,
+            Iterable[AsyncIterable[_S]],
+            StateTuple[_S],
+        ],
     ) -> None:
         super().__init__()
 
-        if isinstance(producers, int):
-            states = [StateVar() for _ in range(producers)]
-        elif isinstance(producers, AsyncIterable):
-            # TODO
-            raise NotImplementedError
+        if isinstance(iterable, int):
+            states = [StateVar() for _ in range(iterable)]
+        elif isinstance(iterable, StateTuple):
+            states = list(iterable)
+        elif isinstance(iterable, AsyncIterable):
+            # TODO length is unknown now; relax the preset _states restriciton
+            raise NotImplementedError()
         else:
             states = []
-            for producer in producers:
+            for producer in iterable:
                 if isinstance(producer, StateVar):
                     statevar = producer
                 elif isinstance(producer, StateTuple):
@@ -281,15 +262,18 @@ class StateTuple(
         else:
             state.set(value)
 
-    @property
-    def readonly(self) -> bool:
-        """.set() cannot be used, but unless the statevar items are readable,
-        they can be set with e.g. self[0] = ...
-        """
-        return True
+    def get(
+        self,
+        index: Maybe[int] = Nothing,
+        /,
+        default: Maybe[_T] = Nothing
+    ) -> _S | _T:
+        if index is Nothing:
+            if default is not Nothing:
+                raise TypeError('default cannot be set if no key is passed')
 
-    def get(self, index: int, default: Maybe[_T] = Nothing) -> _S | _T:
-        # noinspection PyProtectedMember
+            return self._get_data()
+
         return self._states[index].get(default)
 
     def map(self, function, cls=None, *cls_args, **cls_kwargs):
@@ -338,27 +322,20 @@ class StateDict(
     @overload
     def __init__(self, __arg: _StateMap[_K, _S], /, **__kw: StateVar[_S]): ...
     @overload
-    def __init__(self, __arg: AsyncIterable[tuple[_K, _S]], /): ...
+    def __init__(self, __arg: AsyncIterable[tuple[_K, _S | None]], /): ...
     @overload
-    def __init__(self, __arg: AsyncIterable[tuple[_K, StateVar[_S]]], /): ...
+    def __init__(self, __arg: AsyncIterable[Mapping[_K, _S]], /): ...
 
     def __init__(
         self,
         mapping: Maybe[Union[
             Mapping[_K, StateVar[_S]],
             AsyncIterable[tuple[_K, _S]],
-            AsyncIterable[tuple[_K, StateVar[_S]]],
+            AsyncIterable[Mapping[_K, _S]],
         ]] = Nothing,
         /,
         **states: StateVar[_S],
     ):
-        if mapping is not Nothing:
-            if states:
-                raise TypeError(
-                    f'{type(self).__name__}() takes no keyword arguments when '
-                    f'an async iterable is given'
-                )
-
         producer = Nothing
         if mapping is Nothing:
             initial_states = states
@@ -386,8 +363,6 @@ class StateDict(
             if state.is_set and not state.is_error:
                 initial[key] = state.get()
 
-        self._future.set_result(initial)
-
         self._states = {}
         for key, state in initial_states.items():
             if not isinstance(state, StateVar):
@@ -403,6 +378,9 @@ class StateDict(
         self._producer = Nothing
         self._consumer = Nothing
 
+        if initial:
+            self._set_item(initial)
+
         if producer is not Nothing:
             self._set_from(producer)
 
@@ -412,8 +390,12 @@ class StateDict(
     def __iter__(self) -> Iterator[_K]:
         return iter(self._get_states())
 
-    def __aiter__(self) -> AsyncIterator[dict[_K, _S]]:
-        return super().__aiter__()
+    def __aiter__(
+        self,
+        *,
+        buffer: int | None = 4
+    ) -> AsyncIterator[dict[_K, _S]]:
+        return super().__aiter__(buffer=buffer)
 
     def __contains__(self, key: _K) -> bool:
         return key in self._states and self._states[key].is_set
@@ -427,19 +409,17 @@ class StateDict(
         return states[key]
 
     def __setitem__(self, key: _K, value: StateVar[_S] | _S) -> None:
-        if self._producer is not Nothing:
-            raise StateError(f'{self!r} is readonly')
+        self._ensure_mutable()
 
         self._set_item((key, value))
 
     def __delitem__(self, key: _K) -> None:
-        if self._producer is not Nothing:
-            raise StateError(f'{self!r} is readonly')
+        self._ensure_mutable()
 
         if key not in self._states:
             raise KeyError(key)
 
-        self._set_item((key, ...))
+        self._set_item((key, None))
 
     def __missing__(self, key: _K) -> StateVar[_S]:
         assert key not in self._states
@@ -501,18 +481,12 @@ class StateDict(
     def items(self) -> ItemsView[_K, StateVar[_S]]:
         return self._get_states().items()
 
-    @overload
-    def get(self) -> dict[_K, _S]: ...
-    @overload
-    def get(self, key: _K) -> _S: ...
-    @overload
-    def get(self, key: _K, default: _T = ...) -> _S | _T: ...
-
     def get(
         self,
         key: Maybe[_K] = Nothing,
+        /,
         default: Maybe[_T] = Nothing
-    ) -> _S | _T | dict[_K, _S]:
+    ) -> dict[_K, _S] | _S | _T:
         if key is Nothing:
             if default is not Nothing:
                 raise TypeError('default cannot be set if no key is passed')
@@ -521,10 +495,39 @@ class StateDict(
 
         return super().get(key, default=default)
 
-    def clear(self) -> None:
-        states = self._states
+    def update(
+        self,
+        arg: Maybe[Mapping[_K, _S]] | Nothing = Nothing,
+        /,
+        **kwargs: _S
+    ):
+        """Analogous to dict.update().
 
-        for key, state in states.items():
+        Raises StateError if an async iterable (producer) is setting this
+        state.
+        """
+        self._ensure_mutable()
+
+        if arg is Nothing:
+            arg = {}
+        elif isinstance(arg, StateDict):
+            raise NotImplementedError()
+
+        if isinstance(arg, Mapping):
+            for k, v in (arg | kwargs):
+                self[k] = v
+        else:
+            raise TypeError(f'mapping expected, got {type(arg).__name__!r}')
+
+    def clear(self) -> None:
+        """Analogous to dict.clear().
+
+        Raises StateError if an async iterable (producer) is setting this
+        state.
+        """
+        self._ensure_mutable()
+
+        for key, state in self._states.items():
             state._collections.remove((key, self))
 
         self._states.clear()
@@ -542,37 +545,43 @@ class StateDict(
         # noinspection PyProtectedMember
         return {k: s._get(default) for k, s in self._states.items()}
 
-    def _set_item(self, item: tuple[_K, EllipsisType | StateVar[_S] | _S]):
-        if len(item) != 2:
-            raise TypeError(
-                f'{type(self).__name__} async iterable must yield tuples of '
-                f'length 2, got {repr(item)}'
-            )
+    def _set_item(
+        self,
+        item: tuple[_K, StateVar[_S] | _S | None] | Mapping[_K, _S]
+    ):
+        if isinstance(item, tuple):
+            if len(item) != 2:
+                raise TypeError(
+                    f'{type(self).__name__} async iterable must yield tuples '
+                    f'of length 2, got {repr(item)}'
+                )
 
-        key, value = item
-
-        if value is Ellipsis:
-            state = self._states[key]
-            state._collections.remove((key, self))
-
-            del self._states[key]
-
-            self._on_item_del(key)
-
-        elif isinstance(value, StateVar):
-            if key in self._states:
-                state = self._states[key]
-
-                if state.is_set:
-                    raise KeyError(f'{key!r} already set: {state}')
-
-                state.set_from(value)
-
-            else:
-                self._states[key] = value
-                value._collections.append((key, self))
+            items = [item]
+        elif isinstance(item, Mapping):
+            items = list(item.items()) + [
+                (key, None) for key in self.keys() - item.keys()
+            ]
         else:
-            self[key].set(cast(_S, value))
+            raise TypeError(item)
+
+        for key, value in items:
+            if value is None:
+                self._states[key]._clear()
+
+            elif isinstance(value, StateVar):
+                if key in self._states:
+                    state = self._states[key]
+
+                    if state.is_set:
+                        raise KeyError(f'{key!r} already set: {state}')
+
+                    state.set_from(value)
+
+                else:
+                    self._states[key] = value
+                    value._collections.append((key, self))
+            else:
+                self[key].set(cast(_S, value))
 
 
 _SS = TypeVar('_SS', bound=State)

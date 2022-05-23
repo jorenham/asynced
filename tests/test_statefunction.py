@@ -43,8 +43,8 @@ async def test_binary_statevar():
     b.set(4)
     await asyncio.sleep(0)
 
-    assert c.is_set
     assert await c == 5.0
+    assert c.is_set
 
 
 async def test_binary_initial():
