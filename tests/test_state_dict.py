@@ -223,3 +223,15 @@ async def test_changes():
 
     assert len(a) == 1
     assert a[0] == ('spam', 69, 666)
+
+
+async def test_keys_contained():
+    s = StateDict(_producer2())
+    ks = [i async for i in s.keys_contained()]
+
+    assert s.is_done
+    assert ks[0] == ('spam', True)
+    assert ks[1] == ('ham', True)
+    assert ks[2] == ('spam', False)
+    assert ks[3] == ('spam', True)
+    assert ks[4] == ('ham', False)

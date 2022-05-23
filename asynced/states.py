@@ -13,8 +13,8 @@ import itertools
 
 from typing import (
     Any,
-    AsyncIterable,
-    AsyncIterator,
+    AsyncIterable as AIterable,
+    AsyncIterator as AIterator,
     Awaitable,
     Callable,
     cast,
@@ -58,7 +58,7 @@ class StateVar(State[_S], Generic[_S]):
 
     def __init__(
         self,
-        producer: Maybe[AsyncIterable[_S]] = Nothing,
+        producer: Maybe[AIterable[_S]] = Nothing,
         *,
         key: Callable[[_S], Comparable] = lambda s: s,
         name: str | None = None,
@@ -112,7 +112,7 @@ class StateVar(State[_S], Generic[_S]):
 
         return not skip
 
-    def set_from(self, state_producer: State[_S] | AsyncIterable[_S]) -> None:
+    def set_from(self, state_producer: State[_S] | AIterable[_S]) -> None:
         self._ensure_mutable()
 
         self._check()
@@ -141,17 +141,17 @@ class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
     @overload
     def __init__(self, __arg: StateTuple[_S]): ...
     @overload
-    def __init__(self, __arg: Iterable[AsyncIterable[_S]]): ...
+    def __init__(self, __arg: Iterable[AIterable[_S]]): ...
 
     def __init__(
         self,
-        iterable: int | StateTuple[_S] | Iterable[AsyncIterable[_S]],
+        iterable: int | StateTuple[_S] | Iterable[AIterable[_S]],
     ):
         if isinstance(iterable, int):
             states = [StateVar() for _ in range(iterable)]
         elif isinstance(iterable, StateTuple):
             states = list(iterable)
-        elif isinstance(iterable, AsyncIterable):
+        elif isinstance(iterable, AIterable):
             # TODO length is unknown now; relax the preset _states restriciton
             raise NotImplementedError()
         else:
@@ -163,14 +163,14 @@ class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
                     raise TypeError(
                         f'{type(self).__name__!r} cannot contain itself'
                     )
-                elif not isinstance(producer, AsyncIterable):
+                elif not isinstance(producer, AIterable):
                     raise TypeError(
                         f'expected an iterable of StateVar\'s or async '
                         f'iterables, iterable contains '
                         f'{type(producer).__name__!r} instead'
                     )
                 else:
-                    statevar = StateVar(cast(AsyncIterable[_S], producer))
+                    statevar = StateVar(cast(AIterable[_S], producer))
 
                 # noinspection PyProtectedMember
                 states.append(statevar)
@@ -323,16 +323,16 @@ class StateDict(
     @overload
     def __init__(self, __arg: _StateMap[_K, _S], /, **__kw: StateVar[_S]): ...
     @overload
-    def __init__(self, __arg: AsyncIterable[tuple[_K, _S | None]], /): ...
+    def __init__(self, __arg: AIterable[tuple[_K, _S | None]], /): ...
     @overload
-    def __init__(self, __arg: AsyncIterable[Mapping[_K, _S]], /): ...
+    def __init__(self, __arg: AIterable[Mapping[_K, _S]], /): ...
 
     def __init__(
         self,
         mapping: Maybe[Union[
             Mapping[_K, StateVar[_S]],
-            AsyncIterable[tuple[_K, _S]],
-            AsyncIterable[Mapping[_K, _S]],
+            AIterable[tuple[_K, _S]],
+            AIterable[Mapping[_K, _S]],
         ]] = Nothing,
         /,
         **states: StateVar[_S],
@@ -342,7 +342,7 @@ class StateDict(
             initial_states = states
         elif isinstance(mapping, Mapping):
             initial_states = mapping | states
-        elif isinstance(mapping, AsyncIterable):
+        elif isinstance(mapping, AIterable):
             if states:
                 raise TypeError(
                     f'{type(self).__name__}() takes no keyword arguments when '
@@ -397,7 +397,7 @@ class StateDict(
         self,
         *,
         buffer: int | None = 4
-    ) -> AsyncIterator[dict[_K, _S]]:
+    ) -> AIterator[dict[_K, _S]]:
         return super().__aiter__(buffer=buffer)
 
     def __contains__(self, key: _K) -> bool:
@@ -434,46 +434,9 @@ class StateDict(
     @property
     def is_set(self) -> bool:
         return len(self) > 0
-
-    async def additions(self) -> AsyncIterator[tuple[_K, _S]]:
-        """Returns an async iterator that yields tuples of (key, value) items
-        that will be set to a new value."""
-        data_prev = self.get().copy()
-
-        async for data in self:
-            for key_new in data.keys() - data_prev.keys():
-                yield key_new, data[key_new]
-
-            data_prev = data
-
-    async def deletions(self) -> AsyncIterator[tuple[_K, _S]]:
-        """Returns an async iterator that yields tuples of (key, value) items
-        that will be deleted.
-        """
-        data_prev = self.get().copy()
-
-        async for data in self:
-            for key_old in data_prev.keys() - data.keys():
-                yield key_old, data_prev[key_old]
-
-            data_prev = data
-
-    async def changes(self) -> AsyncIterator[tuple[_K, _S, _S]]:
-        """Returns an async iterator that yields tuples of
-        (key, value_old, value_new).
-        """
-        data_prev: dict[_K, _S] = self.get().copy()
-
-        async for data in self:
-            keys_intersection = cast(set[_K], data_prev.keys() & data.keys())
-            for key in keys_intersection:
-                key_fn = self[key]._key
-
-                value_prev, value = key_fn(data_prev[key]), key_fn(data[key])
-                if value_prev is not value and value_prev != value:
-                    yield key, data_prev[key], data[key]
-
-            data_prev = data
+    
+    def items(self) -> ItemsView[_K, StateVar[_S]]:
+        return self._get_states().items()
 
     def keys(self) -> KeysView[_K]:
         return self._get_states().keys()
@@ -481,8 +444,72 @@ class StateDict(
     def values(self) -> ValuesView[StateVar[_S]]:
         return self._get_states().values()
 
-    def items(self) -> ItemsView[_K, StateVar[_S]]:
-        return self._get_states().items()
+    async def differences(self) -> AIterator[
+        tuple[_K, None, _S] | tuple[_K, _S, _S] | tuple[_K, _S, None]
+    ]:
+        """
+        Returns an async iterator that yields either:
+
+        - (K, None, V) for additions: K not in statedict => statedict[K] = V
+        - (K, U, V) for changes: statedict[K] = U => statedict[K] = V
+        - (K, U, None) for changes: statedict[K] = U => del statedict[K]
+
+        This only concerns future differences.
+        """
+        data_prev = self.get().copy()
+
+        async for data in self:
+            outer_join = {
+                k: (data_prev.get(k), data.get(k))
+                for k in data_prev.keys() | data.keys()
+            }
+            for k, (u, v) in outer_join.items():
+                if u is not None and v is not None:
+                    key_fn = self[k]._key
+                    ku, kv = key_fn(u), key_fn(v)
+                    if ku is kv or ku == kv:
+                        continue
+
+                assert not (u is None and v is None)
+
+                yield k, u, v
+
+            data_prev = data
+
+
+    async def additions(self) -> AIterator[tuple[_K, _S]]:
+        """Returns an async iterator that yields tuples of (key, value) items
+        that will be set to a new value."""
+        async for k, u, v in self.differences():
+            if u is None:
+                yield k, v
+
+    async def changes(self) -> AIterator[tuple[_K, _S, _S]]:
+        """Returns an async iterator that yields tuples of
+        (key, value_old, value_new).
+        """
+        async for k, u, v in self.differences():
+            if u is not None and v is not None:
+                yield k, u, v
+
+    async def deletions(self) -> AIterator[tuple[_K, _S]]:
+        """Returns an async iterator that yields tuples of (key, value) items
+        that will be deleted.
+        """
+        async for k, u, v in self.differences():
+            if v is None:
+                yield k, u
+
+    async def keys_contained(self) -> AIterator[tuple[_K, bool]]:
+        """Returns an async iterator of (key, key in self) for the current and
+        future keys.
+        """
+        for k in self:
+            yield k, True
+
+        async for k, u, v in self.differences():
+            if u is None or v is None:
+                yield k, k in self
 
     @overload
     def get(self, key: NothingType = ..., /) -> dict[_K, _S]: ...
