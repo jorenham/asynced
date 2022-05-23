@@ -470,18 +470,22 @@ class StateDict(
                     if ku is kv or ku == kv:
                         continue
 
-                assert not (u is None and v is None)
+                assert (
+                    u is None and v is not None
+                    or u is not None and v is None
+                    or u is not None and v is not None
+                )
 
                 yield k, u, v
 
             data_prev = data
-
 
     async def additions(self) -> AIterator[tuple[_K, _S]]:
         """Returns an async iterator that yields tuples of (key, value) items
         that will be set to a new value."""
         async for k, u, v in self.differences():
             if u is None:
+                assert v is not None
                 yield k, v
 
     async def changes(self) -> AIterator[tuple[_K, _S, _S]]:
@@ -498,6 +502,7 @@ class StateDict(
         """
         async for k, u, v in self.differences():
             if v is None:
+                assert u is not None
                 yield k, u
 
     async def keys_contained(self) -> AIterator[tuple[_K, bool]]:
