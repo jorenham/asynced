@@ -131,25 +131,22 @@ class StateVar(State[_S], Generic[_S]):
         return self._name
 
 
-class StateTuple(
-    StateCollection[int, _S, tuple[_S, ...]],
-    Sequence[_S],
-    Generic[_S],
-):
+class StateTuple(StateCollection[int, _S, tuple[_S, ...]], Generic[_S]):
     __slots__ = ('_states', )
 
     _states: tuple[StateVar[_S], ...]
 
+    @overload
+    def __init__(self, __arg: int): ...
+    @overload
+    def __init__(self, __arg: StateTuple[_S]): ...
+    @overload
+    def __init__(self, __arg: Iterable[AsyncIterable[_S]]): ...
+
     def __init__(
         self,
-        iterable: Union[
-            int,
-            Iterable[AsyncIterable[_S]],
-            StateTuple[_S],
-        ],
-    ) -> None:
-        super().__init__()
-
+        iterable: int | StateTuple[_S] | Iterable[AsyncIterable[_S]],
+    ):
         if isinstance(iterable, int):
             states = [StateVar() for _ in range(iterable)]
         elif isinstance(iterable, StateTuple):
@@ -187,12 +184,16 @@ class StateTuple(
             # noinspection PyProtectedMember
             state._collections.append((i, self))
 
+        super().__init__(
+            key=lambda ss: tuple(sv._key(s) for s, sv in zip(ss, states))
+        )
+
         self._states = tuple(states)
 
         if not self.is_set and all(s.is_set for s in states):
             self._set(tuple(s.get() for s in states))
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[StateVar[_S]]:
         return iter(self._states)
 
     def __contains__(self, item: _S) -> bool:
@@ -267,7 +268,7 @@ class StateTuple(
         index: Maybe[int] = Nothing,
         /,
         default: Maybe[_T] = Nothing
-    ) -> _S | _T:
+    ) -> tuple[_S, ...] | _S | _T:
         if index is Nothing:
             if default is not Nothing:
                 raise TypeError('default cannot be set if no key is passed')
@@ -356,8 +357,6 @@ class StateDict(
                 f'async iterable'
             )
 
-        super().__init__()
-
         initial = {}
         for key, state in initial_states.items():
             if state.is_set and not state.is_error:
@@ -377,6 +376,10 @@ class StateDict(
 
         self._producer = Nothing
         self._consumer = Nothing
+
+        super().__init__(
+            key=lambda ss: {k: self[k]._key(v) for k, v in ss.items()}
+        )
 
         if initial:
             self._set_item(initial)
@@ -481,6 +484,13 @@ class StateDict(
     def items(self) -> ItemsView[_K, StateVar[_S]]:
         return self._get_states().items()
 
+    @overload
+    def get(self, key: NothingType = ..., /) -> dict[_K, _S]: ...
+    @overload
+    def get(self, key: _K, /) -> _S: ...
+    @overload
+    def get(self, key: _K, /, default: _T = ...) -> _S | _T: ...
+
     def get(
         self,
         key: Maybe[_K] = Nothing,
@@ -497,7 +507,7 @@ class StateDict(
 
     def update(
         self,
-        arg: Maybe[Mapping[_K, _S]] | Nothing = Nothing,
+        arg: Maybe[Mapping[_K, _S]] = Nothing,
         /,
         **kwargs: _S
     ):
@@ -514,10 +524,14 @@ class StateDict(
             raise NotImplementedError()
 
         if isinstance(arg, Mapping):
-            for k, v in (arg | kwargs):
+            for k, v in arg.items():
                 self[k] = v
         else:
             raise TypeError(f'mapping expected, got {type(arg).__name__!r}')
+
+        if kwargs:
+            for k, v in cast(dict[_K, _S], kwargs).items():
+                self[k] = v
 
     def clear(self) -> None:
         """Analogous to dict.clear().
@@ -558,9 +572,11 @@ class StateDict(
 
             items = [item]
         elif isinstance(item, Mapping):
-            items = list(item.items()) + [
-                (key, None) for key in self.keys() - item.keys()
-            ]
+            items = []
+            for k, v in item.items():
+                items.append((k, v))
+            for k in (self.keys() - item.keys()):
+                items.append((k, None))
         else:
             raise TypeError(item)
 

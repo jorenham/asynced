@@ -18,6 +18,7 @@ from typing import (
     Final,
     Generator,
     Generic,
+    Iterator,
     Literal,
     Mapping,
     NoReturn,
@@ -152,7 +153,7 @@ class StateBase(Generic[_S]):
         else:
             if done:
                 future = future.get_loop().create_future()
-            future.set_result(value)
+            future.set_result(cast(_S, value))
 
         self.__future = future
 
@@ -304,9 +305,9 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         return super().__await__()
 
     async def __aiter__(self, *, buffer: int | None = 4) -> AsyncIterator[_S]:
-        buffer = collections.deque(maxlen=buffer)
+        futures = collections.deque(maxlen=buffer)
         if self.is_set:
-            buffer.append(self._future)
+            futures.append(self._future)
 
         waiters = self.__waiters
         waiter_id = self.__waiter_counter()
@@ -328,18 +329,18 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             assert waiter_id not in waiters or waiters[waiter_id].done()
             waiters[waiter_id] = future
 
-            buffer.append(future)
+            futures.append(future)
 
         try:
             _schedule_next()
 
             while not self.is_done:
-                if not len(buffer):
+                if not len(futures):
                     await asyncio.sleep(0)
-                    assert len(buffer)
+                    assert len(futures)
 
                 try:
-                    yield await buffer.popleft()
+                    yield await futures.popleft()
                 except StopAnyIteration:
                     break
         finally:
@@ -516,7 +517,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             return 0
 
         del self._future
-        self._future.set_result(value)
+        cast(asyncio.Future[_S], self._future).set_result(value)
 
         self._on_set(value)
         self.__notify_waiters(value)
@@ -546,14 +547,14 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             self._stop()
         else:
             del self._future
-            self._future.set_exception(exc)
+            cast(asyncio.Future[_S], self._future).set_exception(exc)
 
             self._on_error(exc)
             self.__notify_waiters(exc=exc)
 
-    def _cancel(self) -> bool:
+    def _cancel(self) -> None:
         if self._is_cancelled:
-            return False
+            return
 
         self._future.cancel()
 
@@ -664,7 +665,7 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
 class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
     @abc.abstractmethod
-    def __iter__(self): ...
+    def __iter__(self) -> Iterator[State[_S]]: ...
 
     @abc.abstractmethod
     def __contains__(self, item: object) -> bool: ...
@@ -737,7 +738,7 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
         return all(s.is_cancelled for s in self._get_states().values())
 
     @overload
-    def get(self) -> _SS: ...
+    def get(self, key: NothingType = ..., /) -> _SS: ...
     @overload
     def get(self, key: _KT, /) -> _S: ...
     @overload
@@ -749,8 +750,10 @@ class StateCollection(State[_SS], Generic[_KT, _S, _SS]):
         /,
         default: Maybe[_T] = Nothing
     ) -> _SS | _S | _T:
-        states = self._get_states()
-        if key not in states:
+        if key is Nothing:
+            return self._get_data()
+
+        if key not in (states := self._get_states()):
             if default is Nothing:
                 raise KeyError(key)
 
