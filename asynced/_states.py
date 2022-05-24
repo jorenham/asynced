@@ -300,7 +300,10 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
     def __await__(self) -> Generator[Any, None, _S]:
         if not self.is_set:
-            return self.__anext__().__await__()
+            if (future := self._future).done():
+                future.result()  # reraise if needed
+
+            return self._wait_next().__await__()
 
         return super().__await__()
 
@@ -348,8 +351,14 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
                 del waiters[waiter_id]
 
     async def __anext__(self) -> _S:
-        self._check_next()
+        try:
+            return await self._wait_next()
+        except asyncio.CancelledError:
+            raise StopAsyncIteration
 
+    __hash__ = None  # type: ignore
+
+    async def _wait_next(self) -> _S:
         waiters = self.__waiters
         waiter_id = self.__waiter_counter()
 
@@ -357,12 +366,8 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
 
         try:
             return await future
-        except asyncio.CancelledError as exc:
-            raise StopAsyncIteration from exc
         finally:
             del waiters[waiter_id]
-
-    __hash__ = None  # type: ignore
 
     @property
     def readonly(self) -> bool:
