@@ -1,8 +1,12 @@
-import asyncio
 import math
 import operator
+import anyio
+import pytest
 
 from asynced import statefunction, StateVar
+
+
+pytestmark = pytest.mark.anyio
 
 
 async def test_unary_statevar():
@@ -13,14 +17,14 @@ async def test_unary_statevar():
     assert not sl.is_set
 
     s.set('spam')
-    await asyncio.sleep(0)
+    await anyio.sleep(0)
 
     assert sl.is_set
     assert await sl == 4
     assert await slen(s) == 4
 
     s.set('ham')
-    await asyncio.sleep(0)
+    await anyio.sleep(0)
 
     assert await sl == 3
     assert await slen(s) == 3
@@ -36,12 +40,12 @@ async def test_binary_statevar():
     assert not c.is_set
 
     a.set(3)
-    await asyncio.sleep(0)
+    await anyio.sleep(0)
 
     assert not c.is_set
 
     b.set(4)
-    await asyncio.sleep(0)
+    await anyio.sleep(0)
 
     assert await c == 5.0
     assert c.is_set

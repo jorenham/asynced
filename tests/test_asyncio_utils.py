@@ -1,14 +1,18 @@
-import asyncio
+import anyio
+import pytest
 
 from asynced import race
 
 
+pytestmark = pytest.mark.anyio
+
+
 async def test_race():
     async def slowrange(t0, dt, *args):
-        await asyncio.sleep(t0)
+        await anyio.sleep(t0)
         for i in range(*args):
             yield i
-            await asyncio.sleep(dt)
+            await anyio.sleep(dt)
 
     dt = 0.05
     n = 3

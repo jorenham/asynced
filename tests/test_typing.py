@@ -1,4 +1,4 @@
-import asyncio
+import anyio
 
 import pytest
 
@@ -6,18 +6,19 @@ import pytest
 from asynced._typing import acallable, awaitable, ishashclass
 
 
+pytestmark = pytest.mark.anyio
+
+
 async def test_awaitable():
     assert not awaitable(object())
 
-    aw = asyncio.sleep(0)
+    aw = anyio.sleep(0)
     assert awaitable(aw)
     await aw  # to avoid a RuntimeWarning
 
-    assert awaitable(asyncio.get_running_loop().create_future())
-
     class Spam:
         def __await__(self):
-            return asyncio.sleep(0).__await__()
+            return anyio.sleep(0).__await__()
 
     assert not awaitable(Spam)
     assert awaitable(Spam())
@@ -32,7 +33,7 @@ async def test_acallable():
 
     class AFunc:
         def __await__(self):
-            return asyncio.sleep(0).__await__()
+            return anyio.sleep(0).__await__()
 
         def __call__(self, *args, **kwargs):
             return self
@@ -40,11 +41,7 @@ async def test_acallable():
     assert not acallable(sfunc)
     assert not acallable(lambda: ...)
 
-    loop = asyncio.get_running_loop()
-    assert not acallable(loop.create_future)
-    assert not acallable(lambda: loop.create_future)
-
-    assert acallable(asyncio.sleep)
+    assert acallable(anyio.sleep)
     assert acallable(afunc)
     assert not acallable(AFunc)
     assert not acallable(AFunc())

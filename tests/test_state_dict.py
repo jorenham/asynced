@@ -1,7 +1,12 @@
-import asyncio
+import anyio
 from typing import Final
 
+import pytest
+
 from asynced import StateVar, StateDict
+
+
+pytestmark = pytest.mark.anyio
 
 
 DT: Final[float] = 0.01
@@ -10,7 +15,8 @@ DT: Final[float] = 0.01
 async def _producer1():
     items = ('spam', 42), ('ham', 6), ('spam', 69)
     for item in items:
-        yield await asyncio.sleep(DT, item)
+        await anyio.sleep(DT)
+        yield item
 
 
 async def _producer2():
@@ -23,7 +29,8 @@ async def _producer2():
         ('spam', 666),
     ]
     for item in items:
-        yield await asyncio.sleep(DT, item)
+        await anyio.sleep(DT)
+        yield item
 
 
 async def test_initial():
@@ -129,7 +136,7 @@ async def test_producer():
 
 async def test_producer_batch_await():
     async def _producer():
-        await asyncio.sleep(0)
+        await anyio.sleep(0)
         yield 0, 'a'
         yield 1, 'b'
 
@@ -141,7 +148,7 @@ async def test_producer_batch_await():
 
 async def test_producer_batch_await_dict():
     async def _producer():
-        await asyncio.sleep(0)
+        await anyio.sleep(0)
         yield {0: 'a', 1: 'b'}
 
     s = StateDict(_producer())
@@ -152,9 +159,12 @@ async def test_producer_batch_await_dict():
 
 async def test_producer_batch_aiter():
     async def _producer():
-        yield await asyncio.sleep(DT, {0: 0, 1: 0})
-        yield await asyncio.sleep(DT, {0: 1})
-        yield await asyncio.sleep(DT, {1: 0, 2: 1})
+        await anyio.sleep(DT)
+        yield {0: 0, 1: 0}
+        await anyio.sleep(DT)
+        yield {0: 1}
+        await anyio.sleep(DT)
+        yield {1: 0, 2: 1}
 
     s = StateDict(_producer())
     ss = [d async for d in s]
@@ -167,15 +177,15 @@ async def test_producer_batch_aiter():
 
 async def test_producer_batch_dict_aiter():
     async def _producer():
-        await asyncio.sleep(0)
+        await anyio.sleep(0)
         yield 0, 0
         yield 1, 0
 
-        await asyncio.sleep(0)
+        await anyio.sleep(0)
         yield 0, 1
         yield 1, None
 
-        await asyncio.sleep(0)
+        await anyio.sleep(0)
         yield 0, None
         yield 1, 0
         yield 2, 1

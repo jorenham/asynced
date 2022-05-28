@@ -1,4 +1,4 @@
-import asyncio
+import anyio
 import time
 from typing import Final
 
@@ -8,12 +8,10 @@ from asynced import StateVar, StateTuple
 from asynced.compat import aiter, anext
 
 
+pytestmark = pytest.mark.anyio
+
+
 DT: Final[float] = 0.01
-
-
-# @pytest.fixture(scope='function', autouse=True)
-# def timeout_1s():
-#     return 1.0
 
 
 async def test_initial():
@@ -192,11 +190,11 @@ async def test_producers_single_empty():
 async def test_producers_single_stop():
     async def producer():
         yield 'spam'
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 'ham'
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 'eggs'
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
 
     s = StateTuple[str]([producer()])
 
@@ -228,7 +226,7 @@ async def test_producers_single_stop():
 
 async def test_producers_single_error():
     async def producer():
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 1 / 0
 
     s = StateTuple([producer()])
@@ -252,9 +250,9 @@ async def test_producers_single_error():
 
 async def test_producers_single_set_and_error():
     async def producer():
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 1 / 1
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 1 / 0
 
     s = StateTuple([producer()])
@@ -285,16 +283,16 @@ async def test_producers_single_set_and_error():
 async def test_producers_interleaved_stop():
     async def eggs():
         yield 'eggs'
-        await asyncio.sleep(DT * 2)
+        await anyio.sleep(DT * 2)
         yield 'EGGS'
-        await asyncio.sleep(DT * 2)
+        await anyio.sleep(DT * 2)
 
     async def bacon():
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 'bacon'
-        await asyncio.sleep(DT * 2)
+        await anyio.sleep(DT * 2)
         yield 'BACON'
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
 
     s = StateTuple([eggs(), bacon()])
 
@@ -320,18 +318,18 @@ async def test_producers_interleaved_stop():
 async def test_producers_interleaved_error():
     async def producer0():
         yield 1 / 1
-        await asyncio.sleep(DT*2)
+        await anyio.sleep(DT*2)
         yield 0 / 1
-        await asyncio.sleep(DT*2)
+        await anyio.sleep(DT*2)
         yield -1 / 1
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
 
     async def producer1():
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 1 / 1
-        await asyncio.sleep(DT*2)
+        await anyio.sleep(DT*2)
         yield 1 / 0
-        await asyncio.sleep(DT*2)
+        await anyio.sleep(DT*2)
         yield 1 / -1
 
     s = StateTuple([producer0(), producer1()])
@@ -350,7 +348,7 @@ async def test_producers_interleaved_error():
     with pytest.raises(StopAsyncIteration):
         assert await anext(ss) == (-1, -1)
 
-    await asyncio.sleep(DT * 4)
+    await anyio.sleep(DT * 4)
 
     assert s.is_done
     assert s[0].is_done

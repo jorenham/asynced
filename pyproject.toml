@@ -10,11 +10,11 @@ repository = "https://github.com/jorenham/asynced"
 [tool.poetry.dependencies]
 python = ">=3.9,<4"
 typing-extensions = "^4.2"
+anyio = "^3.6"
 
 [tool.poetry.dev-dependencies]
 pyright = "^1.1"
 pytest = "^7.1"
-pytest-asyncio = "^0.18"
 
 [tool.pyright]
 include = ["asynced"]
@@ -34,7 +34,6 @@ executionEnvironments = [
 ]
 
 [tool.pytest.ini_options]
-asyncio_mode = "auto"
 addopts = "--maxfail=1"
 
 

@@ -1,4 +1,4 @@
-import asyncio
+import anyio
 from typing import Final
 
 import pytest
@@ -7,17 +7,15 @@ from asynced import StateVar
 from asynced.compat import anext, aiter
 
 
-DT: Final[float] = .01
+pytestmark = pytest.mark.anyio
 
-#
-# @pytest.fixture(scope='function', autouse=True)
-# def timeout_1s():
-#     return 1.0
+
+DT: Final[float] = .01
 
 
 async def slowrange(dt, *args):
     for i in range(*args):
-        await asyncio.sleep(dt)
+        await anyio.sleep(dt)
         yield i
 
 
@@ -150,7 +148,7 @@ async def test_iterable_set():
     assert not bool(s.is_error)
     assert not bool(s.is_cancelled)
 
-    await asyncio.sleep(DT * 1.1)
+    await anyio.sleep(DT * 1.1)
     assert await s == 43
 
 
@@ -178,7 +176,7 @@ async def test_iterable_exhaust():
 async def test_iterable_error():
     async def itexc():
         yield 'sugma'
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 1 / 0
 
     s = StateVar(itexc())
@@ -196,15 +194,15 @@ async def test_iterable_error():
 
 async def test_iterable_cancelled():
     async def itcancel():
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 'ligma'
-        await asyncio.sleep(DT * 10)
+        await anyio.sleep(DT * 10)
         assert False
 
     s = StateVar(itcancel())
     assert await anext(s) == 'ligma'
 
-    await asyncio.sleep(DT)
+    await anyio.sleep(DT)
 
     s._consumer.cancel()
 
@@ -253,17 +251,17 @@ async def test_iterable_dedupe():
     async def produper():
         yield 'spam'
 
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 'ham'
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield 'ham'
 
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield o1
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield o1
 
-        await asyncio.sleep(DT)
+        await anyio.sleep(DT)
         yield o2
 
     ss = [v async for v in StateVar(produper())]
