@@ -27,6 +27,7 @@ from typing import (
     Union,
 )
 
+import anyio.abc
 from typing_extensions import ParamSpec, Self, TypeAlias
 
 from . import amap_iter
@@ -54,7 +55,7 @@ _DONE_STATUS_KEYS: Final[tuple[_DoneStatus, ...]] = 'stop', 'error', 'cancel'
 _ST = TypeVar('_ST', bound='State')
 
 
-class StateBase(Generic[_S]):
+class StateBase(anyio.abc.AsyncResource, Generic[_S]):
     __slots__ = ('__loop', '__future', )
     __match_args__ = ('_value_raw',)
 
@@ -82,6 +83,9 @@ class StateBase(Generic[_S]):
 
     def __str__(self) -> str:
         return f'<{type(self).__name__}{self._format()}>'
+
+    async def aclose(self) -> None:
+        self._cancel()
 
     @property
     def readonly(self) -> bool:
@@ -356,6 +360,9 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         except asyncio.CancelledError:
             raise StopAsyncIteration
 
+    async def aclose(self) -> None:
+        self._stop()
+
     __hash__ = None  # type: ignore
 
     async def _wait_next(self) -> _S:
@@ -539,6 +546,8 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
         if not future.done():
             future.set_exception(exc)
 
+        self._cancel_consumer()
+
         self._on_stop()
         self.__notify_waiters(exc=exc)
 
@@ -555,6 +564,8 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             cast(asyncio.Future[_S], self._future).set_exception(exc)
 
             self._on_error(exc)
+            self._cancel_consumer()
+
             self.__notify_waiters(exc=exc)
 
     def _cancel(self) -> None:
@@ -562,9 +573,15 @@ class State(AsyncIterator[_S], StateBase[_S], Generic[_S]):
             return
 
         self._future.cancel()
+        self._cancel_consumer()
 
         self._on_cancel()
         self.__notify_waiters(cancel=True)
+
+    def _cancel_consumer(self):
+        consumer = self._consumer
+        if consumer is not Nothing:
+            consumer.cancel('stop')
 
     def _on_set(self, state: _S) -> None:
         self._is_set = True
