@@ -8,6 +8,12 @@
 
 -----
 
+> [!IMPORTANT]
+> Asynced will not be developed any further.
+> [RxIO](https://github.com/jorenham/rxio) will be its spiritual successor.
+
+----
+
 **Async** python for **E**vent-**D**riven applications
 
 ## Installation
